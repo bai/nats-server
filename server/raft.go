@@ -218,8 +218,8 @@ type lps struct {
 }
 
 const (
-	minElectionTimeout = 1000 * time.Millisecond
-	maxElectionTimeout = 5 * minElectionTimeout
+	minElectionTimeout = 2 * time.Second
+	maxElectionTimeout = 5 * time.Second
 	minCampaignTimeout = 100 * time.Millisecond
 	maxCampaignTimeout = 4 * minCampaignTimeout
 	hbInterval         = 500 * time.Millisecond
@@ -309,6 +309,7 @@ func (s *Server) bootstrapRaftNode(cfg *RaftConfig, knownPeers []string, allPeer
 	if err != nil {
 		return fmt.Errorf("raft: storage directory is not writable")
 	}
+	tmpfile.Close()
 	os.Remove(tmpfile.Name())
 
 	return writePeerState(cfg.Store, &peerState{knownPeers, expected})
@@ -672,7 +673,7 @@ func (n *raft) ProposeAddPeer(peer string) error {
 func (n *raft) ProposeRemovePeer(peer string) error {
 	n.RLock()
 	propc, subj := n.propc, n.rpsubj
-	isLeader, isUs := n.state == Leader, n.id == peer
+	isLeader := n.state == Leader
 	werr := n.werr
 	n.RUnlock()
 
@@ -684,9 +685,6 @@ func (n *raft) ProposeRemovePeer(peer string) error {
 	if isLeader {
 		select {
 		case propc <- &Entry{EntryRemovePeer, []byte(peer)}:
-			if isUs {
-				n.attemptStepDown(noLeader)
-			}
 		default:
 			return errProposalFailed
 		}
@@ -892,7 +890,7 @@ func (n *raft) InstallSnapshot(data []byte) error {
 		return err
 	}
 
-	if _, err := n.wal.Compact(snap.lastIndex + 1); err != nil {
+	if _, err := n.wal.Compact(snap.lastIndex); err != nil {
 		n.Unlock()
 		n.setWriteErr(err)
 		return err
@@ -988,6 +986,7 @@ func (n *raft) setupLastSnapshot() {
 		n.pindex = snap.lastIndex
 		n.pterm = snap.lastTerm
 		n.commit = snap.lastIndex
+		n.applied = snap.lastIndex
 		n.applyc <- &CommittedEntry{n.commit, []*Entry{{EntrySnapshot, snap.data}}}
 		if _, err := n.wal.Compact(snap.lastIndex + 1); err != nil {
 			n.setWriteErrLocked(err)
@@ -1107,6 +1106,19 @@ func (n *raft) GroupLeader() string {
 	n.RLock()
 	defer n.RUnlock()
 	return n.leader
+}
+
+// Guess the best next leader. Stepdown will check more thoroughly.
+func (n *raft) selectNextLeader() string {
+	nextLeader, hli := noLeader, uint64(0)
+	for peer, ps := range n.peers {
+		if peer == n.id || ps.li <= hli {
+			continue
+		}
+		hli = ps.li
+		nextLeader = peer
+	}
+	return nextLeader
 }
 
 // StepDown will have a leader stepdown and optionally do a leader transfer.
@@ -1935,8 +1947,8 @@ func (n *raft) sendSnapshotToFollower(subject string) (uint64, error) {
 	ae.pterm, ae.pindex = snap.lastTerm, snap.lastIndex
 	var state StreamState
 	n.wal.FastState(&state)
-	if snap.lastIndex+1 != state.FirstSeq && state.FirstSeq != 0 {
-		snap.lastIndex = state.FirstSeq - 1
+	if snap.lastIndex < state.FirstSeq && state.FirstSeq != 0 {
+		snap.lastIndex = state.FirstSeq
 		ae.pindex = snap.lastIndex
 	}
 	n.sendRPC(subject, n.areply, ae.encode())
@@ -1948,9 +1960,7 @@ func (n *raft) catchupFollower(ar *appendEntryResponse) {
 	n.Lock()
 	if n.progress == nil {
 		n.progress = make(map[string]chan uint64)
-	}
-
-	if ch, ok := n.progress[ar.peer]; ok {
+	} else if ch, ok := n.progress[ar.peer]; ok {
 		n.debug("Will cancel existing entry for catching up %q", ar.peer)
 		delete(n.progress, ar.peer)
 		// Try to pop them out but make sure to not block.
@@ -1964,14 +1974,19 @@ func (n *raft) catchupFollower(ar *appendEntryResponse) {
 	var state StreamState
 	n.wal.FastState(&state)
 
-	if start < state.FirstSeq {
+	if start < state.FirstSeq || state.Msgs == 0 && start <= state.LastSeq {
 		n.debug("Need to send snapshot to follower")
 		if lastIndex, err := n.sendSnapshotToFollower(ar.reply); err != nil {
 			n.error("Error sending snapshot to follower [%s]: %v", ar.peer, err)
-			n.attemptStepDown(noLeader)
 			n.Unlock()
 			return
 		} else {
+			// If no other entries can just return here.
+			if state.Msgs == 0 {
+				n.debug("Finished catching up")
+				n.Unlock()
+				return
+			}
 			n.debug("Snapshot sent, reset first entry to %d", lastIndex)
 			start = lastIndex
 		}
@@ -2113,6 +2128,12 @@ func (n *raft) applyCommit(index uint64) error {
 				}
 			}
 
+			// If this is us and we are the leader we should attempt to stepdown.
+			if peer == n.id && n.state == Leader {
+				n.attemptStepDown(n.selectNextLeader())
+			}
+
+			// Write out our new state.
 			n.writePeerState(&peerState{n.peerNames(), n.csz})
 			// We pass these up as well.
 			committed = append(committed, e)
@@ -2542,6 +2563,9 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 			if ae.pindex == n.pindex {
 				n.truncateWal(ae)
 				n.cancelCatchup()
+				// Make sure pterms match and we take on the leader's.
+				// This prevents constant spinning.
+				n.pterm = ae.pterm
 				n.Unlock()
 				return
 			}
@@ -2706,6 +2730,10 @@ func (n *raft) processAppendEntryResponse(ar *appendEntryResponse) {
 
 // handleAppendEntryResponse processes responses to append entries.
 func (n *raft) handleAppendEntryResponse(sub *subscription, c *client, subject, reply string, msg []byte) {
+	// Ignore if not the leader.
+	if !n.Leader() {
+		return
+	}
 	msg = append(msg[:0:0], msg...)
 	ar := n.decodeAppendEntryResponse(msg)
 	ar.reply = reply
@@ -3185,6 +3213,10 @@ func (n *raft) switchState(state RaftState) {
 
 	if n.state == Leader && state != Leader {
 		n.updateLeadChange(false)
+		// Drain our responses channel.
+		for len(n.respc) > 0 {
+			<-n.respc
+		}
 	} else if state == Leader && n.state != Leader {
 		if len(n.pae) > 0 {
 			n.pae = make(map[uint64]*appendEntry)

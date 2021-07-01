@@ -26,6 +26,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"regexp"
 
 	// Allow dynamic profiling.
 	_ "net/http/pprof"
@@ -98,7 +99,8 @@ type Info struct {
 	GatewayNRP        bool     `json:"gateway_nrp,omitempty"`         // Uses new $GNR. prefix for mapped replies
 
 	// LeafNode Specific
-	LeafNodeURLs []string `json:"leafnode_urls,omitempty"` // LeafNode URLs that the server can reconnect to.
+	LeafNodeURLs  []string `json:"leafnode_urls,omitempty"`  // LeafNode URLs that the server can reconnect to.
+	RemoteAccount string   `json:"remote_account,omitempty"` // Lets the other side know the remote account that they bind to.
 }
 
 // Server is our main struct.
@@ -155,7 +157,8 @@ type Server struct {
 		resolver    netResolver
 		dialTimeout time.Duration
 	}
-	leafRemoteCfgs []*leafNodeCfg
+	leafRemoteCfgs     []*leafNodeCfg
+	leafRemoteAccounts sync.Map
 
 	quitCh           chan struct{}
 	shutdownComplete chan struct{}
@@ -233,6 +236,9 @@ type Server struct {
 	// MQTT structure
 	mqtt srvMQTT
 
+	// OCSP monitoring
+	ocsps []*OCSPMonitor
+
 	// exporting account name the importer experienced issues with
 	incompleteAccExporterMap sync.Map
 
@@ -250,6 +256,11 @@ type Server struct {
 	// For out of resources to not log errors too fast.
 	rerrMu   sync.Mutex
 	rerrLast time.Time
+
+	// If there is a system account configured, to still support the $G account,
+	// the server will create a fake user and add it to the list of users.
+	// Keep track of what that user name is for config reload purposes.
+	sysAccOnlyNoAuthUser string
 }
 
 type nodeInfo struct {
@@ -341,11 +352,18 @@ func NewServer(opts *Options) (*Server, error) {
 		httpBasePath: httpBasePath,
 		eventIds:     nuid.New(),
 		routesToSelf: make(map[string]struct{}),
+		httpReqStats: make(map[string]uint64), // Used to track HTTP requests
 	}
 
 	// Trusted root operator keys.
 	if !s.processTrustedKeys() {
 		return nil, fmt.Errorf("Error processing trusted operator keys")
+	}
+
+	// If we have solicited leafnodes but no clustering and no clustername.
+	// However we may need a stable clustername so use the server name.
+	if len(opts.LeafNode.Remotes) > 0 && opts.Cluster.Port == 0 && opts.Cluster.Name == _EMPTY_ {
+		opts.Cluster.Name = opts.ServerName
 	}
 
 	if opts.Cluster.Name != _EMPTY_ {
@@ -375,6 +393,12 @@ func NewServer(opts *Options) (*Server, error) {
 	// Ensure that non-exported options (used in tests) are properly set.
 	s.setLeafNodeNonExportedOptions()
 
+	// Setup OCSP Stapling. This will abort server from starting if there
+	// are no valid staples and OCSP policy is to Always or MustStaple.
+	if err := s.enableOCSP(); err != nil {
+		return nil, err
+	}
+
 	// Call this even if there is no gateway defined. It will
 	// initialize the structure so we don't have to check for
 	// it to be nil or not in various places in the code.
@@ -383,8 +407,11 @@ func NewServer(opts *Options) (*Server, error) {
 	}
 
 	// If we have a cluster definition but do not have a cluster name, create one.
-	if opts.Cluster.Port != 0 && opts.Cluster.Name == "" {
+	if opts.Cluster.Port != 0 && opts.Cluster.Name == _EMPTY_ {
 		s.info.Cluster = nuid.Next()
+	} else if opts.Cluster.Name != _EMPTY_ {
+		// Likewise here if we have a cluster name set.
+		s.info.Cluster = opts.Cluster.Name
 	}
 
 	// This is normally done in the AcceptLoop, once the
@@ -522,7 +549,7 @@ func (s *Server) setClusterName(name string) {
 
 // Return whether the cluster name is dynamic.
 func (s *Server) isClusterNameDynamic() bool {
-	return s.getOpts().Cluster.Name == ""
+	return s.getOpts().Cluster.Name == _EMPTY_
 }
 
 // ClientURL returns the URL used to connect clients. Helpful in testing
@@ -537,7 +564,10 @@ func (s *Server) ClientURL() string {
 	return fmt.Sprintf("%s%s:%d", scheme, opts.Host, opts.Port)
 }
 
-func validateClusterName(o *Options) error {
+func validateCluster(o *Options) error {
+	if err := validatePinnedCerts(o.Cluster.TLSPinnedCerts); err != nil {
+		return fmt.Errorf("cluster: %v", err)
+	}
 	// Check that cluster name if defined matches any gateway name.
 	if o.Gateway.Name != "" && o.Gateway.Name != o.Cluster.Name {
 		if o.Cluster.Name != "" {
@@ -545,6 +575,17 @@ func validateClusterName(o *Options) error {
 		}
 		// Set this here so we do not consider it dynamic.
 		o.Cluster.Name = o.Gateway.Name
+	}
+	return nil
+}
+
+func validatePinnedCerts(pinned PinnedCertSet) error {
+	re := regexp.MustCompile("^[a-f0-9]{64}$")
+	for certId := range pinned {
+		entry := strings.ToLower(certId)
+		if !re.MatchString(entry) {
+			return fmt.Errorf("error parsing 'pinned_certs' key %s does not look like lower case hex-encoded sha256 of DER encoded SubjectPublicKeyInfo", entry)
+		}
 	}
 	return nil
 }
@@ -573,7 +614,7 @@ func validateOptions(o *Options) error {
 		return err
 	}
 	// Check that cluster name if defined matches any gateway name.
-	if err := validateClusterName(o); err != nil {
+	if err := validateCluster(o); err != nil {
 		return err
 	}
 	if err := validateMQTTOptions(o); err != nil {
@@ -720,15 +761,21 @@ func (s *Server) configureAccounts() error {
 		// We would do this to add user/pass to the system account. If this is the case add in
 		// no-auth-user for $G.
 		if numAccounts == 2 && s.opts.NoAuthUser == _EMPTY_ {
-			// Create a unique name so we do not collide.
-			var b [8]byte
-			rn := rand.Int63()
-			for i, l := 0, rn; i < len(b); i++ {
-				b[i] = digits[l%base]
-				l /= base
+			// If we come here from config reload, let's not recreate the fake user name otherwise
+			// it will cause currently clients to be disconnected.
+			uname := s.sysAccOnlyNoAuthUser
+			if uname == _EMPTY_ {
+				// Create a unique name so we do not collide.
+				var b [8]byte
+				rn := rand.Int63()
+				for i, l := 0, rn; i < len(b); i++ {
+					b[i] = digits[l%base]
+					l /= base
+				}
+				uname = fmt.Sprintf("nats-%s", b[:])
+				s.sysAccOnlyNoAuthUser = uname
 			}
-			uname := fmt.Sprintf("nats-%s", b[:])
-			s.opts.Users = append(s.opts.Users, &User{Username: uname, Password: string(b[:]), Account: s.gacc})
+			s.opts.Users = append(s.opts.Users, &User{Username: uname, Password: uname[6:], Account: s.gacc})
 			s.opts.NoAuthUser = uname
 		}
 	}
@@ -1293,7 +1340,7 @@ func (s *Server) lookupAccount(name string) (*Account, error) {
 	}
 	// If we have a resolver see if it can fetch the account.
 	if s.AccountResolver() == nil {
-		return nil, ErrNoAccountResolver
+		return nil, ErrMissingAccount
 	}
 	return s.fetchAccount(name)
 }
@@ -1359,7 +1406,7 @@ func (s *Server) updateAccountWithClaimJWT(acc *Account, claimJWT string) error 
 func (s *Server) fetchRawAccountClaims(name string) (string, error) {
 	accResolver := s.AccountResolver()
 	if accResolver == nil {
-		return "", ErrNoAccountResolver
+		return _EMPTY_, ErrNoAccountResolver
 	}
 	// Need to do actual Fetch
 	start := time.Now()
@@ -1571,6 +1618,7 @@ func (s *Server) Start() {
 			StoreDir:  opts.StoreDir,
 			MaxMemory: opts.JetStreamMaxMemory,
 			MaxStore:  opts.JetStreamMaxStore,
+			Domain:    opts.JetStreamDomain,
 		}
 		if err := s.EnableJetStream(cfg); err != nil {
 			s.Fatalf("Can't start JetStream: %v", err)
@@ -1585,13 +1633,16 @@ func (s *Server) Start() {
 			acc.mu.RUnlock()
 			if hasJs {
 				s.checkJetStreamExports()
-				acc.enableAllJetStreamServiceImports()
+				acc.enableAllJetStreamServiceImportsAndMappings()
 			}
 			return true
 		})
 	}
 
-	// Start monitoring if needed
+	// Start OCSP Stapling monitoring for TLS certificates if enabled.
+	s.startOCSPMonitoring()
+
+	// Start monitoring if needed.
 	if err := s.StartMonitoring(); err != nil {
 		s.Fatalf("Can't start monitoring: %v", err)
 		return
@@ -1664,6 +1715,9 @@ func (s *Server) Start() {
 // Shutdown will shutdown the server instance by kicking out the AcceptLoop
 // and closing all associated clients.
 func (s *Server) Shutdown() {
+	if s == nil {
+		return
+	}
 	// Transfer off any raft nodes that we are a leader by shutting them all down.
 	s.shutdownRaftNodes()
 
@@ -2066,16 +2120,6 @@ func (s *Server) startMonitoring(secure bool) error {
 	// Snapshot server options.
 	opts := s.getOpts()
 
-	// Used to track HTTP requests
-	s.httpReqStats = map[string]uint64{
-		RootPath:     0,
-		VarzPath:     0,
-		ConnzPath:    0,
-		RoutezPath:   0,
-		GatewayzPath: 0,
-		SubszPath:    0,
-	}
-
 	var (
 		hp           string
 		err          error
@@ -2332,7 +2376,7 @@ func (s *Server) createClient(conn net.Conn) *client {
 			pre = nil
 		}
 		// Performs server-side TLS handshake.
-		if err := c.doTLSServerHandshake(_EMPTY_, opts.TLSConfig, opts.TLSTimeout); err != nil {
+		if err := c.doTLSServerHandshake(_EMPTY_, opts.TLSConfig, opts.TLSTimeout, opts.TLSPinnedCerts); err != nil {
 			c.mu.Unlock()
 			return nil
 		}

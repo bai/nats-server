@@ -21,6 +21,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/url"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -489,7 +490,7 @@ func TestClientConnect(t *testing.T) {
 	if c.state != OP_START {
 		t.Fatalf("Expected state of OP_START vs %d\n", c.state)
 	}
-	if !reflect.DeepEqual(c.opts, clientOpts{Verbose: true, Pedantic: true, Echo: false}) {
+	if !reflect.DeepEqual(c.opts, ClientOpts{Verbose: true, Pedantic: true, Echo: false}) {
 		t.Fatalf("Did not parse connect options correctly: %+v\n", c.opts)
 	}
 
@@ -503,7 +504,7 @@ func TestClientConnect(t *testing.T) {
 	if c.state != OP_START {
 		t.Fatalf("Expected state of OP_START vs %d\n", c.state)
 	}
-	if !reflect.DeepEqual(c.opts, clientOpts{Echo: true, Verbose: true, Pedantic: true, Username: "derek", Password: "foo"}) {
+	if !reflect.DeepEqual(c.opts, ClientOpts{Echo: true, Verbose: true, Pedantic: true, Username: "derek", Password: "foo"}) {
 		t.Fatalf("Did not parse connect options correctly: %+v\n", c.opts)
 	}
 
@@ -518,7 +519,7 @@ func TestClientConnect(t *testing.T) {
 		t.Fatalf("Expected state of OP_START vs %d\n", c.state)
 	}
 
-	if !reflect.DeepEqual(c.opts, clientOpts{Echo: true, Verbose: true, Pedantic: true, Username: "derek", Password: "foo", Name: "router"}) {
+	if !reflect.DeepEqual(c.opts, ClientOpts{Echo: true, Verbose: true, Pedantic: true, Username: "derek", Password: "foo", Name: "router"}) {
 		t.Fatalf("Did not parse connect options correctly: %+v\n", c.opts)
 	}
 
@@ -533,7 +534,7 @@ func TestClientConnect(t *testing.T) {
 		t.Fatalf("Expected state of OP_START vs %d\n", c.state)
 	}
 
-	if !reflect.DeepEqual(c.opts, clientOpts{Echo: true, Verbose: true, Pedantic: true, Token: "YZZ222", Name: "router"}) {
+	if !reflect.DeepEqual(c.opts, ClientOpts{Echo: true, Verbose: true, Pedantic: true, Token: "YZZ222", Name: "router"}) {
 		t.Fatalf("Did not parse connect options correctly: %+v\n", c.opts)
 	}
 }
@@ -551,7 +552,7 @@ func TestClientConnectProto(t *testing.T) {
 	if c.state != OP_START {
 		t.Fatalf("Expected state of OP_START vs %d\n", c.state)
 	}
-	if !reflect.DeepEqual(c.opts, clientOpts{Echo: true, Verbose: true, Pedantic: true, Protocol: ClientProtoZero}) {
+	if !reflect.DeepEqual(c.opts, ClientOpts{Echo: true, Verbose: true, Pedantic: true, Protocol: ClientProtoZero}) {
 		t.Fatalf("Did not parse connect options correctly: %+v\n", c.opts)
 	}
 
@@ -564,7 +565,7 @@ func TestClientConnectProto(t *testing.T) {
 	if c.state != OP_START {
 		t.Fatalf("Expected state of OP_START vs %d\n", c.state)
 	}
-	if !reflect.DeepEqual(c.opts, clientOpts{Echo: true, Verbose: true, Pedantic: true, Protocol: ClientProtoInfo}) {
+	if !reflect.DeepEqual(c.opts, ClientOpts{Echo: true, Verbose: true, Pedantic: true, Protocol: ClientProtoInfo}) {
 		t.Fatalf("Did not parse connect options correctly: %+v\n", c.opts)
 	}
 	if c.opts.Protocol != ClientProtoInfo {
@@ -1685,7 +1686,7 @@ func TestClientUserInfo(t *testing.T) {
 	pnkey := "UD6AYQSOIN2IN5OGC6VQZCR4H3UFMIOXSW6NNS6N53CLJA4PB56CEJJI"
 	c := &client{
 		cid: 1024,
-		opts: clientOpts{
+		opts: ClientOpts{
 			Nkey: pnkey,
 		},
 	}
@@ -1697,7 +1698,7 @@ func TestClientUserInfo(t *testing.T) {
 
 	c = &client{
 		cid: 1024,
-		opts: clientOpts{
+		opts: ClientOpts{
 			Username: "foo",
 		},
 	}
@@ -1709,7 +1710,7 @@ func TestClientUserInfo(t *testing.T) {
 
 	c = &client{
 		cid:  1024,
-		opts: clientOpts{},
+		opts: ClientOpts{},
 	}
 	got = c.getAuthUser()
 	expected = `User "N/A"`
@@ -2516,4 +2517,59 @@ func TestClientLimits(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClientClampMaxSubsErrReport(t *testing.T) {
+	maxSubLimitReportThreshold = int64(100 * time.Millisecond)
+	defer func() { maxSubLimitReportThreshold = defaultMaxSubLimitReportThreshold }()
+
+	o1 := DefaultOptions()
+	o1.MaxSubs = 1
+	o1.LeafNode.Host = "127.0.0.1"
+	o1.LeafNode.Port = -1
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	l := &captureErrorLogger{errCh: make(chan string, 10)}
+	s1.SetLogger(l, false, false)
+
+	o2 := DefaultOptions()
+	u, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", o1.LeafNode.Port))
+	o2.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	checkLeafNodeConnected(t, s1)
+	checkLeafNodeConnected(t, s2)
+
+	nc := natsConnect(t, s2.ClientURL())
+	natsSubSync(t, nc, "foo")
+	natsSubSync(t, nc, "bar")
+
+	// Make sure we receive only 1
+	check := func() {
+		t.Helper()
+		for i := 0; i < 2; i++ {
+			select {
+			case errStr := <-l.errCh:
+				if i > 0 {
+					t.Fatalf("Should not have logged a second time: %s", errStr)
+				}
+				if !strings.Contains(errStr, "maximum subscriptions") {
+					t.Fatalf("Unexpected error: %s", errStr)
+				}
+			case <-time.After(300 * time.Millisecond):
+				if i == 0 {
+					t.Fatal("Error should have been logged")
+				}
+			}
+		}
+	}
+	check()
+
+	// The above will have waited long enough to clear the report threshold.
+	// So create two new subs and check again that we get only 1 report.
+	natsSubSync(t, nc, "baz")
+	natsSubSync(t, nc, "bat")
+	check()
 }

@@ -566,12 +566,15 @@ func TestFileStoreBytesLimit(t *testing.T) {
 }
 
 func TestFileStoreAgeLimit(t *testing.T) {
-	maxAge := 10 * time.Millisecond
+	maxAge := 100 * time.Millisecond
 
 	storeDir := createDir(t, JetStreamStoreDir)
 	defer removeDir(t, storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage, MaxAge: maxAge})
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 256},
+		StreamConfig{Name: "zzz", Storage: FileStorage, MaxAge: maxAge},
+	)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -579,7 +582,7 @@ func TestFileStoreAgeLimit(t *testing.T) {
 
 	// Store some messages. Does not really matter how many.
 	subj, msg := "foo", []byte("Hello World")
-	toStore := 100
+	toStore := 500
 	for i := 0; i < toStore; i++ {
 		fs.StoreMsg(subj, nil, msg)
 	}
@@ -589,7 +592,7 @@ func TestFileStoreAgeLimit(t *testing.T) {
 	}
 	checkExpired := func(t *testing.T) {
 		t.Helper()
-		checkFor(t, time.Second, maxAge, func() error {
+		checkFor(t, 5*time.Second, maxAge, func() error {
 			state = fs.State()
 			if state.Msgs != 0 {
 				return fmt.Errorf("Expected no msgs, got %d", state.Msgs)
@@ -602,6 +605,7 @@ func TestFileStoreAgeLimit(t *testing.T) {
 	}
 	// Let them expire
 	checkExpired(t)
+
 	// Now add some more and make sure that timer will fire again.
 	for i := 0; i < toStore; i++ {
 		fs.StoreMsg(subj, nil, msg)
@@ -2724,9 +2728,6 @@ func TestFileStoreConsumerPerf(t *testing.T) {
 	start = time.Now()
 	oc.writeState(buf)
 	fmt.Printf("time to write is %v\n", time.Since(start))
-	start = time.Now()
-	oc.syncStateFile()
-	fmt.Printf("time to sync is %v\n", time.Since(start))
 }
 
 func TestFileStoreStreamIndexBug(t *testing.T) {
@@ -2827,5 +2828,63 @@ func TestFileStoreStreamPurgeAndDirtyRestartBug(t *testing.T) {
 	state = fs.State()
 	if state.FirstSeq != uint64(num+1) || state.LastSeq != uint64(num) {
 		t.Fatalf("Unexpected state: %+v", state)
+	}
+}
+
+// rip
+func TestFileStoreStreamFailToRollBug(t *testing.T) {
+	storeDir := createDir(t, JetStreamStoreDir)
+	defer removeDir(t, storeDir)
+
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: storeDir, BlockSize: 512},
+		StreamConfig{Name: "zzz", Storage: FileStorage, MaxBytes: 300},
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer fs.Stop()
+
+	// Make sure we properly roll underlying blocks.
+	n, msg := 200, bytes.Repeat([]byte("ABC"), 33) // ~100bytes
+	for i := 0; i < n; i++ {
+		if _, _, err := fs.StoreMsg("zzz", nil, msg); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	// Grab some info for introspection.
+	fs.mu.RLock()
+	numBlks := len(fs.blks)
+	var index uint64
+	var blkSize int64
+	if numBlks > 0 {
+		mb := fs.blks[0]
+		mb.mu.RLock()
+		index = mb.index
+		if fi, _ := os.Stat(mb.mfn); fi != nil {
+			blkSize = fi.Size()
+		}
+		mb.mu.RUnlock()
+	}
+	fs.mu.RUnlock()
+
+	if numBlks != 1 {
+		t.Fatalf("Expected only one block, got %d", numBlks)
+	}
+	if index < 60 {
+		t.Fatalf("Expected a block index > 60, got %d", index)
+	}
+	if blkSize > 512 {
+		t.Fatalf("Expected block to be <= 512, got %d", blkSize)
+	}
+}
+
+// We had a case where a consumer state had a redelivered record that had seq of 0.
+// This was causing the server to panic.
+func TestBadConsumerState(t *testing.T) {
+	bs := []byte("\x16\x02\x01\x01\x03\x02\x01\x98\xf4\x8a\x8a\f\x01\x03\x86\xfa\n\x01\x00\x01")
+	if cs, err := decodeConsumerState(bs); err != nil || cs == nil {
+		t.Fatalf("Expected to not throw error, got %v and %+v", err, cs)
 	}
 }

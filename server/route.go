@@ -1087,6 +1087,7 @@ func (c *client) processRemoteSub(argo []byte, hasOrigin bool) (err error) {
 
 	osub := c.subs[key]
 	updateGWs := false
+	delta := int32(1)
 	if osub == nil {
 		c.subs[key] = sub
 		// Now place into the account sl.
@@ -1100,17 +1101,18 @@ func (c *client) processRemoteSub(argo []byte, hasOrigin bool) (err error) {
 		updateGWs = srv.gateway.enabled
 	} else if sub.queue != nil {
 		// For a queue we need to update the weight.
+		delta = sub.qw - atomic.LoadInt32(&osub.qw)
 		atomic.StoreInt32(&osub.qw, sub.qw)
 		acc.sl.UpdateRemoteQSub(osub)
 	}
 	c.mu.Unlock()
 
 	if updateGWs {
-		srv.gatewayUpdateSubInterest(acc.Name, sub, 1)
+		srv.gatewayUpdateSubInterest(acc.Name, sub, delta)
 	}
 
 	// Now check on leafnode updates.
-	srv.updateLeafNodes(acc, sub, 1)
+	srv.updateLeafNodes(acc, sub, delta)
 
 	if c.opts.Verbose {
 		c.sendOK()
@@ -1290,7 +1292,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 		}
 	}
 
-	c := &client{srv: s, nc: conn, opts: clientOpts{}, kind: ROUTER, msubs: -1, mpay: -1, route: r}
+	c := &client{srv: s, nc: conn, opts: ClientOpts{}, kind: ROUTER, msubs: -1, mpay: -1, route: r}
 
 	// Grab server variables
 	s.mu.Lock()
@@ -1330,7 +1332,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 			tlsConfig = tlsConfig.Clone()
 		}
 		// Perform (server or client side) TLS handshake.
-		if _, err := c.doTLSHandshake("route", didSolicit, rURL, tlsConfig, _EMPTY_, opts.Cluster.TLSTimeout); err != nil {
+		if _, err := c.doTLSHandshake("route", didSolicit, rURL, tlsConfig, _EMPTY_, opts.Cluster.TLSTimeout, opts.Cluster.TLSPinnedCerts); err != nil {
 			c.mu.Unlock()
 			return nil
 		}

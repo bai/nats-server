@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -293,7 +295,7 @@ func TestJetStreamAddStreamDiscardNew(t *testing.T) {
 			}
 
 			// Now do bytes.
-			mset.purge()
+			mset.purge(nil)
 
 			big := make([]byte, 8192)
 			resp, _ = nc.Request(subj, big, 100*time.Millisecond)
@@ -826,7 +828,7 @@ func TestJetStreamAddStreamCanonicalNames(t *testing.T) {
 
 	expectErr := func(_ *stream, err error) {
 		t.Helper()
-		if err == nil || !strings.Contains(err.Error(), "can not contain") {
+		if !IsNatsErr(err, JSStreamInvalidConfigF) {
 			t.Fatalf("Expected error but got none")
 		}
 	}
@@ -875,7 +877,7 @@ func TestJetStreamAddStreamBadSubjects(t *testing.T) {
 	expectAPIErr(StreamConfig{Name: "MyStream", Storage: MemoryStorage, Subjects: []string{".>"}})
 }
 
-func TestJetStreamAddStreamMaxConsumers(t *testing.T) {
+func TestJetStreamMaxConsumers(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer s.Shutdown()
 
@@ -883,24 +885,32 @@ func TestJetStreamAddStreamMaxConsumers(t *testing.T) {
 		defer removeDir(t, config.StoreDir)
 	}
 
-	nc := clientConnectToServer(t, s)
+	nc, js := jsClientConnect(t, s)
 	defer nc.Close()
 
-	cfg := &StreamConfig{
+	cfg := &nats.StreamConfig{
 		Name:         "MAXC",
-		Storage:      MemoryStorage,
+		Storage:      nats.MemoryStorage,
 		Subjects:     []string{"in.maxc.>"},
 		MaxConsumers: 1,
 	}
-
-	acc := s.GlobalAccount()
-	mset, err := acc.addStream(cfg)
-	if err != nil {
-		t.Fatalf("Unexpected error adding stream: %v", err)
+	if _, err := js.AddStream(cfg); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
 	}
-
-	if mset.config().MaxConsumers != 1 {
-		t.Fatalf("Expected 1 MaxConsumers, got %d", mset.config().MaxConsumers)
+	si, err := js.StreamInfo("MAXC")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if si.Config.MaxConsumers != 1 {
+		t.Fatalf("Expected max of 1, got %d", si.Config.MaxConsumers)
+	}
+	// Make sure we get the right error.
+	// This should succeed.
+	if _, err := js.SubscribeSync("in.maxc.foo"); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if _, err := js.SubscribeSync("in.maxc.bar"); err == nil {
+		t.Fatalf("Eexpected error but got none")
 	}
 }
 
@@ -1779,7 +1789,7 @@ func TestJetStreamWorkQueueRequest(t *testing.T) {
 				sub.NextMsg(time.Millisecond)
 			}
 			checkSubPending(0)
-			mset.purge()
+			mset.purge(nil)
 
 			// Now do expiration
 			req.Batch = 1
@@ -2212,7 +2222,7 @@ func TestJetStreamWorkQueueRequestBatch(t *testing.T) {
 			// Now queue up the request without messages and add them after.
 			sub, _ = nc.SubscribeSync(nats.NewInbox())
 			defer sub.Unsubscribe()
-			mset.purge()
+			mset.purge(nil)
 
 			nc.PublishRequest(o.requestNextMsgSubject(), sub.Subject, []byte(strconv.Itoa(batchSize)))
 			nc.Flush() // Make sure its registered.
@@ -2309,9 +2319,6 @@ func TestJetStreamWorkQueueRetentionStream(t *testing.T) {
 			defer o2.delete()
 
 			// Anything that would overlap should fail though.
-			if _, err := mset.addConsumer(pConfig(">")); err == nil {
-				t.Fatalf("Expected an error on attempt for partitioned consumer for a workqueue")
-			}
 			if _, err := mset.addConsumer(pConfig("MY_WORK_QUEUE.A")); err == nil {
 				t.Fatalf("Expected an error on attempt for partitioned consumer for a workqueue")
 			}
@@ -2522,7 +2529,7 @@ func TestJetStreamAckReplyStreamPending(t *testing.T) {
 
 			expectPending(toSend*2 - 2)
 			// Purge and send a new one.
-			mset.purge()
+			mset.purge(nil)
 			nc.Flush()
 
 			sendStreamMsg(t, nc, "foo.1", "Hello World!")
@@ -2539,7 +2546,7 @@ func TestJetStreamAckReplyStreamPending(t *testing.T) {
 			expectPending(toSend - 4) // 203
 
 			// Test Expiration.
-			mset.purge()
+			mset.purge(nil)
 			for i := 0; i < toSend; i++ {
 				sendStreamMsg(t, nc, "foo.1", "Hello World!")
 			}
@@ -2586,7 +2593,7 @@ func TestJetStreamAckReplyStreamPending(t *testing.T) {
 			}
 			nc.Flush()
 			expectPending(100)
-			mset.purge()
+			mset.purge(nil)
 			sendStreamMsg(t, nc, "foo.22", "Hello World!")
 			expectPending(0)
 		})
@@ -3300,7 +3307,7 @@ func TestJetStreamPublishDeDupe(t *testing.T) {
 	if err := mset.update(&cfg); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	mset.purge()
+	mset.purge(nil)
 
 	// Send 5 new messages.
 	sendMsg(10, "AAAA", "Hello DeDupe!")
@@ -3345,7 +3352,7 @@ func TestJetStreamPublishDeDupe(t *testing.T) {
 	}
 
 	// Purge should wipe the msgIds as well.
-	mset.purge()
+	mset.purge(nil)
 	nmids(0)
 }
 
@@ -4291,7 +4298,7 @@ func TestJetStreamSnapshotsAPI(t *testing.T) {
 		t.Fatalf("Unexpected error on snapshot request: %v", err)
 	}
 	json.Unmarshal(rmsg.Data, &rresp)
-	if rresp.Error == nil || rresp.Error.Code != 500 || !strings.Contains(rresp.Error.Description, "already in use") {
+	if !IsNatsErr(rresp.Error, JSStreamNameExistErr) {
 		t.Fatalf("Did not get correct error response: %+v", rresp.Error)
 	}
 
@@ -5579,7 +5586,7 @@ func TestJetStreamStreamPurge(t *testing.T) {
 			if state := mset.state(); state.Msgs != 100 {
 				t.Fatalf("Expected %d messages, got %d", 100, state.Msgs)
 			}
-			mset.purge()
+			mset.purge(nil)
 			state := mset.state()
 			if state.Msgs != 0 {
 				t.Fatalf("Expected %d messages, got %d", 0, state.Msgs)
@@ -5670,7 +5677,7 @@ func TestJetStreamStreamPurgeWithConsumer(t *testing.T) {
 				t.Fatalf("Expected len(pending) to be 25, got %d", state.NumAckPending)
 			}
 			// Now do purge.
-			mset.purge()
+			mset.purge(nil)
 			if state := mset.state(); state.Msgs != 0 {
 				t.Fatalf("Expected %d messages, got %d", 0, state.Msgs)
 			}
@@ -5758,7 +5765,7 @@ func TestJetStreamStreamPurgeWithConsumerAndRedelivery(t *testing.T) {
 			// Now wait to make sure we are in a redelivered state.
 			time.Sleep(wcfg.AckWait * 2)
 			// Now do purge.
-			mset.purge()
+			mset.purge(nil)
 			if state := mset.state(); state.Msgs != 0 {
 				t.Fatalf("Expected %d messages, got %d", 0, state.Msgs)
 			}
@@ -6979,10 +6986,10 @@ func TestJetStreamSimpleFileRecovery(t *testing.T) {
 	}
 	pusage := acc.JetStreamUsage()
 
-	// Shutdown the  Restart and make sure things come back.
+	// Shutdown and restart and make sure things come back.
 	s.Shutdown()
 
-	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
 		delta := (runtime.NumGoroutine() - base)
 		if delta > 3 {
 			return fmt.Errorf("%d Go routines still exist post Shutdown()", delta)
@@ -7416,34 +7423,13 @@ func TestJetStreamRequestAPI(t *testing.T) {
 		t.Fatalf("Created time seems wrong: %v\n", scResp.Created)
 	}
 
-	checkBadRequest := func(e *ApiError, description string) {
-		t.Helper()
-		if e == nil || e.Code != 400 || e.Description != description {
-			t.Fatalf("Did not get proper error: %+v", e)
-		}
-	}
-
-	checkServerError := func(e *ApiError, description string) {
-		t.Helper()
-		if e == nil || e.Code != 500 || e.Description != description {
-			t.Fatalf("Did not get proper server error: %+v\n", e)
-		}
-	}
-
-	checkNotFound := func(e *ApiError, description string) {
-		t.Helper()
-		if e == nil || e.Code != 404 || e.Description != description {
-			t.Fatalf("Did not get proper server error: %+v\n", e)
-		}
-	}
-
 	// Check that the name in config has to match the name in the subject
 	resp, _ = nc.Request(fmt.Sprintf(JSApiStreamCreateT, "BOB"), req, time.Second)
 	scResp.Error, scResp.StreamInfo = nil, nil
 	if err := json.Unmarshal(resp.Data, &scResp); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	checkBadRequest(scResp.Error, "stream name in subject does not match request")
+	checkNatsError(t, scResp.Error, JSStreamMismatchErr)
 
 	// Check that update works.
 	msetCfg.Subjects = []string{"foo", "bar", "baz"}
@@ -7568,7 +7554,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	if err = json.Unmarshal(resp.Data, &bResp); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	checkNotFound(bResp.Error, "stream not found")
+	checkNatsError(t, bResp.Error, JSStreamNotFoundErr)
 
 	// Now create a consumer.
 	delivery := nats.NewInbox()
@@ -7588,7 +7574,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	if err = json.Unmarshal(resp.Data, &ccResp); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	checkServerError(ccResp.Error, "consumer requires interest for delivery subject when ephemeral")
+	checkNatsError(t, ccResp.Error, JSConsumerCreateErrF)
 
 	// Now create subscription and make sure we get proper response.
 	sub, _ := nc.SubscribeSync(delivery)
@@ -7626,7 +7612,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	// Since we do not have interest this should have failed.
-	checkBadRequest(ccResp.Error, "stream name in subject does not match request")
+	checkNatsError(t, ccResp.Error, JSStreamMismatchErr)
 
 	// Get the list of all of the consumers for our stream.
 	resp, err = nc.Request(fmt.Sprintf(JSApiConsumersT, msetCfg.Name), nil, time.Second)
@@ -7696,7 +7682,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	if err = json.Unmarshal(resp.Data, &ccResp); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	checkBadRequest(ccResp.Error, "consumer expected to be ephemeral but a durable name was set in request")
+	checkNatsError(t, ccResp.Error, JSConsumerEphemeralWithDurableNameErr)
 
 	// Now make sure we can create a durable on the subject with the proper name.
 	resp, err = nc.Request(fmt.Sprintf(JSApiDurableCreateT, msetCfg.Name, obsReq.Config.Durable), req, time.Second)
@@ -7725,7 +7711,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	if err = json.Unmarshal(resp.Data, &ccResp); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	checkBadRequest(ccResp.Error, "consumer expected to be durable but a durable name was not set")
+	checkNatsError(t, ccResp.Error, JSConsumerDurableNameNotSetErr)
 
 	// Now delete a msg.
 	dreq := JSApiMsgDeleteRequest{Seq: 2}
@@ -7803,7 +7789,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	if err = json.Unmarshal(resp.Data, &stResp); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	checkBadRequest(stResp.Error, "template name in subject does not match request")
+	checkNatsError(t, stResp.Error, JSTemplateNameNotMatchSubjectErr)
 
 	resp, _ = nc.Request(fmt.Sprintf(JSApiTemplateCreateT, template.Name), req, time.Second)
 	stResp.Error, stResp.StreamTemplateInfo = nil, nil
@@ -7856,7 +7842,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	if err = json.Unmarshal(resp.Data, &tDeleteResp); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	checkServerError(tDeleteResp.Error, "template not found")
+	checkNatsError(t, tDeleteResp.Error, JSStreamTemplateNotFoundErr)
 
 	resp, _ = nc.Request(fmt.Sprintf(JSApiTemplateDeleteT, "ss"), nil, time.Second)
 	tDeleteResp.Error = nil
@@ -8297,7 +8283,7 @@ func TestJetStreamDeleteMsg(t *testing.T) {
 			deleteAndCheck(3, 2)
 			deleteAndCheck(2, 4)
 
-			mset.purge()
+			mset.purge(nil)
 			// Put ten more one.
 			pubTen()
 			deleteAndCheck(11, 12)
@@ -8569,7 +8555,7 @@ func TestJetStreamMsgHeaders(t *testing.T) {
 			// Calculate the []byte version of the headers.
 			var b bytes.Buffer
 			b.WriteString("NATS/1.0\r\n")
-			m.Header.Write(&b)
+			http.Header(m.Header).Write(&b)
 			b.WriteString("\r\n")
 			hdr := b.Bytes()
 
@@ -9091,6 +9077,72 @@ func TestJetStreamServerResourcesConfig(t *testing.T) {
 	}
 	if jsc.MaxStore != 1024*gb {
 		t.Fatalf("Expected MaxStore to be %d, got %d", 1024*gb, jsc.MaxStore)
+	}
+}
+
+// From 2.2.2 to 2.2.3 we fixed a bug that would not consistently place a jetstream directory
+// under the store directory configured. However there were some cases where the directory was
+// created that way and therefore 2.2.3 would start and not recognize the existing accounts,
+// streams and consumers.
+func TestJetStreamStoreDirectoryFix(t *testing.T) {
+	sd := filepath.Join(os.TempDir(), "sd_test")
+	defer removeDir(t, sd)
+
+	conf := createConfFile(t, []byte(fmt.Sprintf("listen: 127.0.0.1:-1\njetstream: {store_dir: %q}\n", sd)))
+	defer removeFile(t, conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "TEST"}); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if _, err := js.Publish("TEST", []byte("TSS")); err != nil {
+		t.Fatalf("Unexpected publish error: %v", err)
+	}
+	// Push based.
+	sub, err := js.SubscribeSync("TEST", nats.Durable("dlc"))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	// Now shutdown the server.
+	nc.Close()
+	s.Shutdown()
+
+	// Now move stuff up from the jetstream directory etc.
+	jssd := filepath.Join(sd, JetStreamStoreDir)
+	fis, _ := ioutil.ReadDir(jssd)
+	// This will be accounts, move them up one directory.
+	for _, fi := range fis {
+		os.Rename(filepath.Join(jssd, fi.Name()), filepath.Join(sd, fi.Name()))
+	}
+	removeDir(t, jssd)
+
+	// Restart our server. Make sure our assets got moved.
+	s, _ = RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	var names []string
+	for name := range js.StreamNames() {
+		names = append(names, name)
+	}
+	if len(names) != 1 {
+		t.Fatalf("Expected only 1 stream but got %d", len(names))
+	}
+	names = names[:0]
+	for name := range js.ConsumerNames("TEST") {
+		names = append(names, name)
+	}
+	if len(names) != 1 {
+		t.Fatalf("Expected only 1 consumer but got %d", len(names))
 	}
 }
 
@@ -10041,7 +10093,7 @@ func TestJetStreamConsumerMaxAckPending(t *testing.T) {
 			checkSubPending(maxAckPending)
 
 			o.stop()
-			mset.purge()
+			mset.purge(nil)
 
 			// Now test a consumer that is live while we publish messages to the stream.
 			o, err = mset.addConsumer(&ConsumerConfig{
@@ -10744,6 +10796,416 @@ func TestJetStreamConfigReloadWithGlobalAccount(t *testing.T) {
 	checkJSAccount()
 }
 
+// Test that we properly enfore per subject msg limits.
+func TestJetStreamMaxMsgsPerSubject(t *testing.T) {
+	const maxPer = 5
+	msc := StreamConfig{
+		Name:       "TEST",
+		Subjects:   []string{"foo", "bar", "baz.*"},
+		Storage:    MemoryStorage,
+		MaxMsgsPer: maxPer,
+	}
+	fsc := msc
+	fsc.Storage = FileStorage
+
+	cases := []struct {
+		name    string
+		mconfig *StreamConfig
+	}{
+		{"MemoryStore", &msc},
+		{"FileStore", &fsc},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer()
+			defer s.Shutdown()
+
+			if config := s.JetStreamConfig(); config != nil {
+				defer removeDir(t, config.StoreDir)
+			}
+
+			mset, err := s.GlobalAccount().addStream(c.mconfig)
+			if err != nil {
+				t.Fatalf("Unexpected error adding stream: %v", err)
+			}
+			defer mset.delete()
+
+			// Client for API requests.
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			pubAndCheck := func(subj string, num int, expectedNumMsgs uint64) {
+				t.Helper()
+				for i := 0; i < num; i++ {
+					if _, err = js.Publish(subj, []byte("TSLA")); err != nil {
+						t.Fatalf("Unexpected publish error: %v", err)
+					}
+				}
+				si, err := js.StreamInfo("TEST")
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				if si.State.Msgs != expectedNumMsgs {
+					t.Fatalf("Expected %d msgs, got %d", expectedNumMsgs, si.State.Msgs)
+				}
+			}
+
+			pubAndCheck("foo", 1, 1)
+			pubAndCheck("foo", 4, 5)
+			// Now make sure our per subject limits kick in..
+			pubAndCheck("foo", 2, 5)
+			pubAndCheck("baz.22", 5, 10)
+			pubAndCheck("baz.33", 5, 15)
+			// We are maxed so totals should be same no matter what we add here.
+			pubAndCheck("baz.22", 5, 15)
+			pubAndCheck("baz.33", 5, 15)
+
+			// Now purge and make sure all is still good.
+			mset.purge(nil)
+			pubAndCheck("foo", 1, 1)
+			pubAndCheck("foo", 4, 5)
+			pubAndCheck("baz.22", 5, 10)
+			pubAndCheck("baz.33", 5, 15)
+		})
+	}
+}
+
+func TestJetStreamGetLastMsgBySubject(t *testing.T) {
+	for _, st := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(st.String(), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, "JSC", 3)
+			defer c.shutdown()
+
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			cfg := StreamConfig{
+				Name:       "KV",
+				Subjects:   []string{"kv.>"},
+				Storage:    st,
+				Replicas:   2,
+				MaxMsgsPer: 20,
+			}
+
+			req, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			// Do manually for now.
+			nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
+			si, err := js.StreamInfo("KV")
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if si == nil || si.Config.Name != "KV" {
+				t.Fatalf("StreamInfo is not correct %+v", si)
+			}
+
+			for i := 0; i < 1000; i++ {
+				msg := []byte(fmt.Sprintf("VAL-%d", i+1))
+				js.PublishAsync("kv.foo", msg)
+				js.PublishAsync("kv.bar", msg)
+				js.PublishAsync("kv.baz", msg)
+			}
+			select {
+			case <-js.PublishAsyncComplete():
+			case <-time.After(5 * time.Second):
+				t.Fatalf("Did not receive completion signal")
+			}
+
+			// Check that if both set that errors.
+			b, _ := json.Marshal(JSApiMsgGetRequest{LastFor: "kv.foo", Seq: 950})
+			rmsg, err := nc.Request(fmt.Sprintf(JSApiMsgGetT, "KV"), b, time.Second)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			var resp JSApiMsgGetResponse
+			err = json.Unmarshal(rmsg.Data, &resp)
+			if err != nil {
+				t.Fatalf("Could not parse stream message: %v", err)
+			}
+			if resp.Error == nil {
+				t.Fatalf("Expected an error when both are set, got %+v", resp.Error)
+			}
+
+			// Need to do stream GetMsg by hand for now until Go client support lands.
+			getLast := func(subject string) *StoredMsg {
+				t.Helper()
+				req := &JSApiMsgGetRequest{LastFor: subject}
+				b, _ := json.Marshal(req)
+				rmsg, err := nc.Request(fmt.Sprintf(JSApiMsgGetT, "KV"), b, time.Second)
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				var resp JSApiMsgGetResponse
+				err = json.Unmarshal(rmsg.Data, &resp)
+				if err != nil {
+					t.Fatalf("Could not parse stream message: %v", err)
+				}
+				if resp.Message == nil || resp.Error != nil {
+					t.Fatalf("Did not receive correct response: %+v", resp.Error)
+				}
+				return resp.Message
+			}
+			// Do basic checks.
+			basicCheck := func(subject string, expectedSeq uint64) {
+				sm := getLast(subject)
+				if sm == nil {
+					t.Fatalf("Expected a message but got none")
+				} else if string(sm.Data) != "VAL-1000" {
+					t.Fatalf("Wrong message payload, wanted %q but got %q", "VAL-1000", sm.Data)
+				} else if sm.Sequence != expectedSeq {
+					t.Fatalf("Wrong message sequence, wanted %d but got %d", expectedSeq, sm.Sequence)
+				} else if !subjectIsSubsetMatch(sm.Subject, subject) {
+					t.Fatalf("Wrong subject, wanted %q but got %q", subject, sm.Subject)
+				}
+			}
+
+			basicCheck("kv.foo", 2998)
+			basicCheck("kv.bar", 2999)
+			basicCheck("kv.baz", 3000)
+			basicCheck("kv.*", 3000)
+			basicCheck(">", 3000)
+		})
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/2329
+func TestJetStreamGetLastMsgBySubjectAfterUpdate(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	sc := &nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 2,
+	}
+	if _, err := js.AddStream(sc); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// Now Update and add in other subjects.
+	sc.Subjects = append(sc.Subjects, "bar", "baz")
+	if _, err := js.UpdateStream(sc); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	js.Publish("foo", []byte("OK1")) // 1
+	js.Publish("bar", []byte("OK1")) // 2
+	js.Publish("foo", []byte("OK2")) // 3
+	js.Publish("bar", []byte("OK2")) // 4
+
+	// Need to do stream GetMsg by hand for now until Go client support lands.
+	getLast := func(subject string) *StoredMsg {
+		t.Helper()
+		req := &JSApiMsgGetRequest{LastFor: subject}
+		b, _ := json.Marshal(req)
+		rmsg, err := nc.Request(fmt.Sprintf(JSApiMsgGetT, "TEST"), b, time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		var resp JSApiMsgGetResponse
+		err = json.Unmarshal(rmsg.Data, &resp)
+		if err != nil {
+			t.Fatalf("Could not parse stream message: %v", err)
+		}
+		if resp.Message == nil || resp.Error != nil {
+			t.Fatalf("Did not receive correct response: %+v", resp.Error)
+		}
+		return resp.Message
+	}
+	// Do basic checks.
+	basicCheck := func(subject string, expectedSeq uint64) {
+		sm := getLast(subject)
+		if sm == nil {
+			t.Fatalf("Expected a message but got none")
+		} else if sm.Sequence != expectedSeq {
+			t.Fatalf("Wrong message sequence, wanted %d but got %d", expectedSeq, sm.Sequence)
+		} else if !subjectIsSubsetMatch(sm.Subject, subject) {
+			t.Fatalf("Wrong subject, wanted %q but got %q", subject, sm.Subject)
+		}
+	}
+
+	basicCheck("foo", 3)
+	basicCheck("bar", 4)
+}
+
+func TestJetStreamLastSequenceBySubject(t *testing.T) {
+	for _, st := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(st.String(), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, "JSC", 3)
+			defer c.shutdown()
+
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			cfg := StreamConfig{
+				Name:       "KV",
+				Subjects:   []string{"kv.>"},
+				Storage:    st,
+				Replicas:   3,
+				MaxMsgsPer: 1,
+			}
+
+			req, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			// Do manually for now.
+			nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
+			si, err := js.StreamInfo("KV")
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if si == nil || si.Config.Name != "KV" {
+				t.Fatalf("StreamInfo is not correct %+v", si)
+			}
+
+			js.PublishAsync("kv.foo", []byte("1"))
+			js.PublishAsync("kv.bar", []byte("2"))
+			js.PublishAsync("kv.baz", []byte("3"))
+
+			select {
+			case <-js.PublishAsyncComplete():
+			case <-time.After(time.Second):
+				t.Fatalf("Did not receive completion signal")
+			}
+
+			// Now make sure we get an error if the last sequence is not correct per subject.
+			pubAndCheck := func(subj, seq string, ok bool) {
+				t.Helper()
+				m := nats.NewMsg(subj)
+				m.Data = []byte("HELLO")
+				m.Header.Set(JSExpectedLastSubjSeq, seq)
+				_, err := js.PublishMsg(m)
+				if ok && err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				if !ok && err == nil {
+					t.Fatalf("Expected to get an error and got none")
+				}
+			}
+
+			pubAndCheck("kv.foo", "1", true)  // So last is now 4.
+			pubAndCheck("kv.foo", "1", false) // This should fail.
+			pubAndCheck("kv.bar", "2", true)
+			pubAndCheck("kv.bar", "5", true)
+			pubAndCheck("kv.xxx", "5", false)
+		})
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/2314
+func TestJetStreamMaxMsgsPerAndDiscardNew(t *testing.T) {
+	for _, st := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(st.String(), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, "JSC", 3)
+			defer c.shutdown()
+
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			cfg := StreamConfig{
+				Name:       "KV",
+				Subjects:   []string{"kv.>"},
+				Storage:    st,
+				Discard:    DiscardNew,
+				MaxMsgsPer: 1,
+				Replicas:   3,
+			}
+
+			req, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			// Do manually for now.
+			nc.Request(fmt.Sprintf(JSApiStreamCreateT, cfg.Name), req, time.Second)
+			si, err := js.StreamInfo("KV")
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if si == nil || si.Config.Name != "KV" {
+				t.Fatalf("StreamInfo is not correct %+v", si)
+			}
+
+			js.Publish("kv.1", []byte("ok"))
+			js.Publish("kv.2", []byte("ok"))
+			js.Publish("kv.3", []byte("ok"))
+
+			if si, _ := js.StreamInfo("KV"); si == nil || si.State.Msgs != 3 {
+				t.Fatalf("Expected 3 messages, got %d", si.State.Msgs)
+			}
+			// This should fail.
+			if pa, err := js.Publish("kv.1", []byte("last")); err == nil {
+				t.Fatalf("Expected an error, got %+v and %v", pa, err)
+			}
+			// Make sure others work after the above failure.
+			if _, err := js.Publish("kv.22", []byte("favorite")); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestJetStreamFilteredConsumersWithWiderFilter(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	// Origin
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar", "baz", "N.*"},
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Add in some messages.
+	js.Publish("foo", []byte("OK"))
+	js.Publish("bar", []byte("OK"))
+	js.Publish("baz", []byte("OK"))
+	for i := 0; i < 12; i++ {
+		js.Publish(fmt.Sprintf("N.%d", i+1), []byte("OK"))
+	}
+
+	checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+		si, err := js.StreamInfo("TEST")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if si.State.Msgs != 15 {
+			return fmt.Errorf("Expected 15 msgs, got state: %+v", si.State)
+		}
+		return nil
+	})
+
+	checkWider := func(subj string, numExpected int) {
+		sub, err := js.SubscribeSync(subj)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		defer sub.Unsubscribe()
+		checkSubsPending(t, sub, numExpected)
+	}
+
+	checkWider("*", 3)
+	checkWider("N.*", 12)
+	checkWider("*.*", 12)
+	checkWider("N.>", 12)
+	checkWider(">", 15)
+}
+
 func TestJetStreamMirrorAndSourcesFilteredConsumers(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer s.Shutdown()
@@ -11121,13 +11583,10 @@ func TestJetStreamSourceBasics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	if reply := m.Header.Get(JSStreamSource); reply == _EMPTY_ {
+	if shdr := m.Header.Get(JSStreamSource); shdr == _EMPTY_ {
 		t.Fatalf("Expected a header, got none")
-	} else {
-		sseq, _, _, _, _ := replyInfo(reply)
-		if sseq != 26 {
-			t.Fatalf("Expected header sequence of 26, got %d", sseq)
-		}
+	} else if _, sseq := streamAndSeq(shdr); sseq != 26 {
+		t.Fatalf("Expected header sequence of 26, got %d", sseq)
 	}
 
 	// Test Filters
@@ -11154,13 +11613,10 @@ func TestJetStreamSourceBasics(t *testing.T) {
 	if m, err = js.GetMsg("FMS2", 1); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	if reply := m.Header.Get(JSStreamSource); reply == _EMPTY_ {
+	if shdr := m.Header.Get(JSStreamSource); shdr == _EMPTY_ {
 		t.Fatalf("Expected a header, got none")
-	} else {
-		sseq, _, _, _, _ := replyInfo(reply)
-		if sseq != 11 {
-			t.Fatalf("Expected header sequence of 11, got %d", sseq)
-		}
+	} else if _, sseq := streamAndSeq(shdr); sseq != 11 {
+		t.Fatalf("Expected header sequence of 11, got %d", sseq)
 	}
 }
 
@@ -11175,7 +11631,7 @@ func TestJetStreamOperatorAccounts(t *testing.T) {
 	nc, js := jsClientConnect(t, s, nats.UserCredentials("./configs/one.creds"))
 	defer nc.Close()
 
-	if _, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 2}); err != nil {
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "TEST"}); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
@@ -11205,6 +11661,364 @@ func TestJetStreamOperatorAccounts(t *testing.T) {
 	if jsz.Messages != uint64(toSend) {
 		t.Fatalf("Expected jsz to report our %d messages on restart, got %d", toSend, jsz.Messages)
 	}
+}
+
+func TestJetStreamServerDomainBadConfig(t *testing.T) {
+	shouldFail := func(domain string) {
+		t.Helper()
+		opts := DefaultTestOptions
+		opts.JetStreamDomain = domain
+		if err := validateOptions(&opts); err == nil || !strings.Contains(err.Error(), "invalid domain name") {
+			t.Fatalf("Expected bad domain error, got %v", err)
+		}
+	}
+
+	shouldFail("HU..B")
+	shouldFail("HU B")
+	shouldFail(" ")
+	shouldFail("\t")
+	shouldFail("CORE.")
+	shouldFail(".CORE")
+	shouldFail("C.*.O. RE")
+	shouldFail("C.ORE")
+}
+
+func TestJetStreamServerDomainConfig(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		jetstream: {domain: "HUB"}
+	`))
+	defer removeFile(t, conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	if !s.JetStreamEnabled() {
+		t.Fatalf("Expected JetStream to be enabled")
+	}
+
+	config := s.JetStreamConfig()
+	if config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	if config.Domain != "HUB" {
+		t.Fatalf("Expected %q as domain name, got %q", "HUB", config.Domain)
+	}
+}
+
+func TestJetStreamServerDomainConfigButDisabled(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		jetstream: {domain: "HUB", enabled: false}
+	`))
+	defer removeFile(t, conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	if s.JetStreamEnabled() {
+		t.Fatalf("Expected JetStream NOT to be enabled")
+	}
+
+	opts := s.getOpts()
+	if opts.JetStreamDomain != "HUB" {
+		t.Fatalf("Expected %q as opts domain name, got %q", "HUB", opts.JetStreamDomain)
+	}
+}
+
+// Issue #2213
+func TestJetStreamDirectConsumersBeingReported(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name: "S",
+		Sources: []*nats.StreamSource{{
+			Name: "TEST",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if _, err = js.Publish("foo", nil); err != nil {
+		t.Fatalf("Unexpected publish error: %v", err)
+	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		si, err := js.StreamInfo("S")
+		if err != nil {
+			return fmt.Errorf("Could not get stream info: %v", err)
+		}
+		if si.State.Msgs != 1 {
+			return fmt.Errorf("Expected 1 msg, got state: %+v", si.State)
+		}
+		return nil
+	})
+
+	si, err := js.StreamInfo("TEST")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Direct consumers should not be reported
+	if si.State.Consumers != 0 {
+		t.Fatalf("Did not expect any consumers, got %d", si.State.Consumers)
+	}
+
+	// Now check for consumer in consumer names list.
+	var names []string
+	for name := range js.ConsumerNames("TEST") {
+		names = append(names, name)
+	}
+	if len(names) != 0 {
+		t.Fatalf("Expected no consumers but got %+v", names)
+	}
+
+	// Now check detailed list.
+	var cis []*nats.ConsumerInfo
+	for ci := range js.ConsumersInfo("TEST") {
+		cis = append(cis, ci)
+	}
+	if len(cis) != 0 {
+		t.Fatalf("Expected no consumers but got %+v", cis)
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/2290
+func TestJetStreamTemplatedErrorsBug(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	_, err = js.PullSubscribe("foo", "")
+	if err != nil && strings.Contains(err.Error(), "{err}") {
+		t.Fatalf("Error is not filled in: %v", err)
+	}
+}
+
+func TestJetStreamServerEncryption(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		jetstream: {key: $JS_KEY}
+	`))
+	defer removeFile(t, conf)
+
+	os.Setenv("JS_KEY", "s3cr3t!!")
+	defer os.Unsetenv("JS_KEY")
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	config := s.JetStreamConfig()
+	if config == nil {
+		t.Fatalf("Expected config but got none")
+	}
+	defer removeDir(t, config.StoreDir)
+
+	// Client based API
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	cfg := &nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar", "baz"},
+	}
+	if _, err := js.AddStream(cfg); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	msg := []byte("ENCRYPTED PAYLOAD!!")
+	sendMsg := func(subj string) {
+		t.Helper()
+		if _, err := js.Publish(subj, msg); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+	// Send 10 msgs
+	for i := 0; i < 10; i++ {
+		sendMsg("foo")
+	}
+
+	// Now create a consumer.
+	sub, err := js.PullSubscribe("foo", "dlc")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	for i, m := range fetchMsgs(t, sub, 10, 5*time.Second) {
+		if i < 5 {
+			m.Ack()
+		}
+	}
+
+	// Grab our state to compare after restart.
+	si, _ := js.StreamInfo("TEST")
+	ci, _ := js.ConsumerInfo("TEST", "dlc")
+
+	// Quick check to make sure everything not just plaintext still.
+	sdir := path.Join(config.StoreDir, "$G", "streams", "TEST")
+	// Make sure we can not find any plaintext strings in the target file.
+	checkFor := func(fn string, strs ...string) {
+		t.Helper()
+		data, err := ioutil.ReadFile(fn)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		for _, str := range strs {
+			if bytes.Contains(data, []byte(str)) {
+				t.Fatalf("Found %q in body of file contents", str)
+			}
+		}
+	}
+	checkKeyFile := func(fn string) {
+		t.Helper()
+		if _, err := os.Stat(fn); err != nil {
+			t.Fatalf("Expected a key file at %q", fn)
+		}
+	}
+
+	// Check stream meta.
+	checkEncrypted := func() {
+		checkKeyFile(path.Join(sdir, JetStreamMetaFileKey))
+		checkFor(path.Join(sdir, JetStreamMetaFile), "TEST", "foo", "bar", "baz", "max_msgs", "max_bytes")
+		// Check a message block.
+		checkKeyFile(path.Join(sdir, "msgs", "1.key"))
+		checkFor(path.Join(sdir, "msgs", "1.blk"), "ENCRYPTED PAYLOAD!!", "foo", "bar", "baz")
+
+		// Check consumer meta and state.
+		checkKeyFile(path.Join(sdir, "obs", "dlc", JetStreamMetaFileKey))
+		checkFor(path.Join(sdir, "obs", "dlc", JetStreamMetaFile), "TEST", "dlc", "foo", "bar", "baz", "max_msgs", "ack_policy")
+		// Load and see if we can parse the consumer state.
+		state, err := ioutil.ReadFile(path.Join(sdir, "obs", "dlc", "o.dat"))
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if _, err := decodeConsumerState(state); err == nil {
+			t.Fatalf("Expected decoding consumer state to fail")
+		}
+	}
+
+	// Stop current
+	s.Shutdown()
+
+	checkEncrypted()
+
+	// Restart.
+	s, _ = RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Connect again.
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	si2, err := js.StreamInfo("TEST")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(si, si2) {
+		t.Fatalf("Stream infos did not match\n%+v\nvs\n%+v", si, si2)
+	}
+
+	ci2, _ := js.ConsumerInfo("TEST", "dlc")
+	// Consumer create times can be slightly off after restore from disk.
+	now := time.Now()
+	ci.Created, ci2.Created = now, now
+	// Also clusters will be different.
+	ci.Cluster, ci2.Cluster = nil, nil
+	if !reflect.DeepEqual(ci, ci2) {
+		t.Fatalf("Consumer infos did not match\n%+v\nvs\n%+v", ci, ci2)
+	}
+
+	// Send 10 more msgs
+	for i := 0; i < 10; i++ {
+		sendMsg("foo")
+	}
+	if si, err = js.StreamInfo("TEST"); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if si.State.Msgs != 20 {
+		t.Fatalf("Expected 20 msgs total, got %d", si.State.Msgs)
+	}
+
+	// Now test snapshots etc.
+	acc := s.GlobalAccount()
+	mset, err := acc.lookupStream("TEST")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	scfg := mset.config()
+	sr, err := mset.snapshot(5*time.Second, false, true)
+	if err != nil {
+		t.Fatalf("Error getting snapshot: %v", err)
+	}
+	snapshot, err := ioutil.ReadAll(sr.Reader)
+	if err != nil {
+		t.Fatalf("Error reading snapshot")
+	}
+
+	// Run new server w/o encryption. Make sure we can restore properly (meaning encryption was stripped etc).
+	ns := RunBasicJetStreamServer()
+	defer ns.Shutdown()
+
+	nacc := ns.GlobalAccount()
+	r := bytes.NewReader(snapshot)
+	mset, err = nacc.RestoreStream(&scfg, r)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	ss := mset.store.State()
+	if ss.Msgs != si.State.Msgs || ss.FirstSeq != si.State.FirstSeq || ss.LastSeq != si.State.LastSeq {
+		t.Fatalf("Stream states do not match: %+v vs %+v", ss, si.State)
+	}
+
+	// Now restore to our encrypted server as well.
+	if err := js.DeleteStream("TEST"); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	acc = s.GlobalAccount()
+	r.Reset(snapshot)
+	mset, err = acc.RestoreStream(&scfg, r)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	ss = mset.store.State()
+	if ss.Msgs != si.State.Msgs || ss.FirstSeq != si.State.FirstSeq || ss.LastSeq != si.State.LastSeq {
+		t.Fatalf("Stream states do not match: %+v vs %+v", ss, si.State)
+	}
+
+	// Check that all is encrypted like above since we know we need to convert since snapshots always plaintext.
+	checkEncrypted()
 }
 
 ///////////////////////////////////////////////////////////////////////////

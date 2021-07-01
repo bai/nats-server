@@ -16,6 +16,7 @@ package server
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -25,6 +26,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -147,6 +149,7 @@ func TestTLSConfigFile(t *testing.T) {
 		t.Fatal("Expected opts.TLSConfig to be non-nil")
 	}
 	opts.TLSConfig = nil
+	opts.tlsConfigOpts = nil
 	checkOptionsEqual(t, golden, opts)
 
 	// Now check TLSConfig a bit more closely
@@ -888,6 +891,94 @@ func TestNkeyUsersConfig(t *testing.T) {
 	}
 }
 
+// Test pinned certificates
+func TestTlsPinnedCertificates(t *testing.T) {
+	confFileName := createConfFile(t, []byte(`
+	tls {
+		cert_file: "./configs/certs/server.pem"
+		key_file: "./configs/certs/key.pem"
+		# Require a client certificate and map user id from certificate
+		verify: true
+		pinned_certs: ["7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069",
+			"a8f407340dcc719864214b85ed96f98d16cbffa8f509d9fa4ca237b7bb3f9c32"]
+	}
+	cluster {
+		port -1
+		name cluster-hub
+		tls {
+			cert_file: "./configs/certs/server.pem"
+			key_file: "./configs/certs/key.pem"
+			# Require a client certificate and map user id from certificate
+			verify: true
+			pinned_certs: ["7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069",
+				"a8f407340dcc719864214b85ed96f98d16cbffa8f509d9fa4ca237b7bb3f9c32"]
+		}
+	}
+	leafnodes {
+		port -1
+		tls {
+			cert_file: "./configs/certs/server.pem"
+			key_file: "./configs/certs/key.pem"
+			# Require a client certificate and map user id from certificate
+			verify: true
+			pinned_certs: ["7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069",
+				"a8f407340dcc719864214b85ed96f98d16cbffa8f509d9fa4ca237b7bb3f9c32"]
+		}
+	}
+	gateway {
+		name: "A"
+		port -1
+		tls {
+			cert_file: "./configs/certs/server.pem"
+			key_file: "./configs/certs/key.pem"
+			# Require a client certificate and map user id from certificate
+			verify: true
+			pinned_certs: ["7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069",
+				"a8f407340dcc719864214b85ed96f98d16cbffa8f509d9fa4ca237b7bb3f9c32"]
+		}
+	}
+	websocket {
+		port -1
+		tls {
+			cert_file: "./configs/certs/server.pem"
+			key_file: "./configs/certs/key.pem"
+			# Require a client certificate and map user id from certificate
+			verify: true
+			pinned_certs: ["7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069",
+				"a8f407340dcc719864214b85ed96f98d16cbffa8f509d9fa4ca237b7bb3f9c32"]
+		}
+	}
+	mqtt {
+		port -1
+		tls {
+			cert_file: "./configs/certs/server.pem"
+			key_file: "./configs/certs/key.pem"
+			# Require a client certificate and map user id from certificate
+			verify: true
+			pinned_certs: ["7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069",
+				"a8f407340dcc719864214b85ed96f98d16cbffa8f509d9fa4ca237b7bb3f9c32"]
+		}
+	}`))
+	defer removeFile(t, confFileName)
+	opts, err := ProcessConfigFile(confFileName)
+	if err != nil {
+		t.Fatalf("Received an error reading config file: %v", err)
+	}
+	check := func(set PinnedCertSet) {
+		t.Helper()
+		if l := len(set); l != 2 {
+			t.Fatalf("Expected 2 pinned certificates, got got %d", l)
+		}
+	}
+
+	check(opts.TLSPinnedCerts)
+	check(opts.LeafNode.TLSPinnedCerts)
+	check(opts.Cluster.TLSPinnedCerts)
+	check(opts.MQTT.TLSPinnedCerts)
+	check(opts.Gateway.TLSPinnedCerts)
+	check(opts.Websocket.TLSPinnedCerts)
+}
+
 func TestNkeyUsersDefaultPermissionsConfig(t *testing.T) {
 	confFileName := createConfFile(t, []byte(`
 	authorization {
@@ -1521,6 +1612,10 @@ func TestConfigureOptions(t *testing.T) {
 	if opts.TLSConfig == nil || !opts.TLS {
 		t.Fatal("Expected TLSConfig to be set")
 	}
+	// Check that we use default TLS ciphers
+	if !reflect.DeepEqual(opts.TLSConfig.CipherSuites, defaultCipherSuites()) {
+		t.Fatalf("Default ciphers not set, expected %v, got %v", defaultCipherSuites(), opts.TLSConfig.CipherSuites)
+	}
 }
 
 func TestClusterPermissionsConfig(t *testing.T) {
@@ -1889,24 +1984,36 @@ func TestParseExport(t *testing.T) {
 	defer nc1.Close()
 	nc2 := connect("u2")
 	defer nc2.Close()
-	subscribe := func(nc *nats.Conn, msgs int, subj string) (*sync.WaitGroup, *nats.Subscription) {
-		wg := sync.WaitGroup{}
-		wg.Add(msgs)
-		sub, err := nc.Subscribe(subj, func(msg *nats.Msg) {
+
+	// Due to the fact that above CONNECT events are generated and sent from
+	// a system go routine, it is possible that by the time we create the
+	// subscriptions below, the interest would exist and messages be sent,
+	// which was causing issues since wg.Done() was called too many times.
+	// Add a little delay to minimize risk, but also use counter to decide
+	// when to call wg.Done() to avoid panic due to negative number.
+	time.Sleep(100 * time.Millisecond)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	count := int32(0)
+	// We expect a total of 6 messages
+	expected := int32(6)
+	subscribe := func(nc *nats.Conn, subj string) {
+		t.Helper()
+		_, err := nc.Subscribe(subj, func(msg *nats.Msg) {
 			if msg.Reply != _EMPTY_ {
 				msg.Respond(msg.Data)
 			}
-			wg.Done()
+			if atomic.AddInt32(&count, 1) == expected {
+				wg.Done()
+			}
 		})
 		require_NoError(t, err)
 		nc.Flush()
-		return &wg, sub
 	}
 	//Subscribe to CONNS events
-	wg1, s1 := subscribe(nc1, 2, "$SYS.SERVER.ACCOUNT.accI1.CONNS")
-	defer s1.Unsubscribe()
-	wg2, s2 := subscribe(nc2, 2, "$SYS.SERVER.ACCOUNT.accI2.CONNS")
-	defer s2.Unsubscribe()
+	subscribe(nc1, "$SYS.SERVER.ACCOUNT.accI1.CONNS")
+	subscribe(nc2, "$SYS.SERVER.ACCOUNT.accI2.CONNS")
 	// Trigger 2 CONNS event
 	nc3 := connect("u1")
 	nc3.Close()
@@ -1915,8 +2022,7 @@ func TestParseExport(t *testing.T) {
 	// test service
 	ncE := connect("ue")
 	defer ncE.Close()
-	wge, se := subscribe(ncE, 2, "foo.*")
-	defer se.Unsubscribe()
+	subscribe(ncE, "foo.*")
 	request := func(nc *nats.Conn, msg string) {
 		if m, err := nc.Request("foo", []byte(msg), time.Second); err != nil {
 			t.Fatal("Failed request ", msg, err)
@@ -1928,9 +2034,7 @@ func TestParseExport(t *testing.T) {
 	}
 	request(nc1, "1")
 	request(nc2, "1")
-	for _, wg := range []*sync.WaitGroup{wge, wg1, wg2} {
-		wg.Wait()
-	}
+	wg.Wait()
 }
 
 func TestAccountUsersLoadedProperly(t *testing.T) {
@@ -2047,6 +2151,7 @@ func TestParsingGateways(t *testing.T) {
 		t.Fatalf("Expected TLSConfig, got none")
 	}
 	opts.Gateway.TLSConfig = nil
+	opts.Gateway.tlsConfigOpts = nil
 	if !reflect.DeepEqual(&opts.Gateway, expected) {
 		t.Fatalf("Expected %v, got %v", expected, opts.Gateway)
 	}
@@ -2308,7 +2413,11 @@ func TestParsingLeafNodesListener(t *testing.T) {
 	if opts.LeafNode.TLSConfig == nil {
 		t.Fatalf("Expected TLSConfig, got none")
 	}
+	if opts.LeafNode.tlsConfigOpts == nil {
+		t.Fatalf("Expected TLSConfig snapshot, got none")
+	}
 	opts.LeafNode.TLSConfig = nil
+	opts.LeafNode.tlsConfigOpts = nil
 	if !reflect.DeepEqual(&opts.LeafNode, expected) {
 		t.Fatalf("Expected %v, got %v", expected, opts.LeafNode)
 	}
@@ -2381,6 +2490,75 @@ func TestParsingLeafNodeRemotes(t *testing.T) {
 		expected.URLs = append(expected.URLs, u)
 		if !reflect.DeepEqual(opts.LeafNode.Remotes[0], expected) {
 			t.Fatalf("Expected %v, got %v", expected, opts.LeafNode.Remotes[0])
+		}
+	})
+
+	t.Run("url ordering", func(t *testing.T) {
+		// 16! possible permutations.
+		orderedURLs := make([]string, 0, 16)
+		for i := 0; i < cap(orderedURLs); i++ {
+			orderedURLs = append(orderedURLs, fmt.Sprintf("nats-leaf://host%d:7422", i))
+		}
+		confURLs, err := json.Marshal(orderedURLs)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		content := `
+		leafnodes {
+			remotes = [
+				{
+					dont_randomize: true
+					urls: %[1]s
+				}
+				{
+					urls: %[1]s
+				}
+			]
+		}
+		`
+		conf := createConfFile(t, []byte(fmt.Sprintf(content, confURLs)))
+		defer removeFile(t, conf)
+
+		s, _ := RunServerWithConfig(conf)
+		defer s.Shutdown()
+
+		s.mu.Lock()
+		r1 := s.leafRemoteCfgs[0]
+		r2 := s.leafRemoteCfgs[1]
+		s.mu.Unlock()
+
+		r1.RLock()
+		gotOrdered := r1.urls
+		r1.RUnlock()
+		if got, want := len(gotOrdered), len(orderedURLs); got != want {
+			t.Fatalf("Unexpected rem0 len URLs, got %d, want %d", got, want)
+		}
+
+		// These should be IN order.
+		for i := range orderedURLs {
+			if got, want := gotOrdered[i].String(), orderedURLs[i]; got != want {
+				t.Fatalf("Unexpected ordered url, got %s, want %s", got, want)
+			}
+		}
+
+		r2.RLock()
+		gotRandom := r2.urls
+		r2.RUnlock()
+		if got, want := len(gotRandom), len(orderedURLs); got != want {
+			t.Fatalf("Unexpected rem1 len URLs, got %d, want %d", got, want)
+		}
+
+		// These should be OUT of order.
+		var random bool
+		for i := range orderedURLs {
+			if gotRandom[i].String() != orderedURLs[i] {
+				random = true
+				break
+			}
+		}
+		if !random {
+			t.Fatal("Expected urls to be random")
 		}
 	})
 }

@@ -1,4 +1,4 @@
-// Copyright 2019-2020 The NATS Authors
+// Copyright 2019-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,6 +27,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nkeys"
 
 	jwt "github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
@@ -82,6 +84,68 @@ func TestLeafNodeRandomIP(t *testing.T) {
 	case <-l.ch:
 	case <-time.After(3 * time.Second):
 		t.Fatalf("Does not seem to have used random IPs")
+	}
+}
+
+func TestLeafNodeRandomRemotes(t *testing.T) {
+	// 16! possible permutations.
+	orderedURLs := make([]*url.URL, 0, 16)
+	for i := 0; i < cap(orderedURLs); i++ {
+		orderedURLs = append(orderedURLs, &url.URL{
+			Scheme: "nats-leaf",
+			Host:   fmt.Sprintf("host%d:7422", i),
+		})
+	}
+
+	o := DefaultOptions()
+	o.LeafNode.Remotes = []*RemoteLeafOpts{
+		{NoRandomize: true},
+		{NoRandomize: false},
+	}
+	o.LeafNode.Remotes[0].URLs = make([]*url.URL, cap(orderedURLs))
+	copy(o.LeafNode.Remotes[0].URLs, orderedURLs)
+	o.LeafNode.Remotes[1].URLs = make([]*url.URL, cap(orderedURLs))
+	copy(o.LeafNode.Remotes[1].URLs, orderedURLs)
+
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	s.mu.Lock()
+	r1 := s.leafRemoteCfgs[0]
+	r2 := s.leafRemoteCfgs[1]
+	s.mu.Unlock()
+
+	r1.RLock()
+	gotOrdered := r1.urls
+	r1.RUnlock()
+	if got, want := len(gotOrdered), len(orderedURLs); got != want {
+		t.Fatalf("Unexpected rem0 len URLs, got %d, want %d", got, want)
+	}
+
+	// These should be IN order.
+	for i := range orderedURLs {
+		if got, want := gotOrdered[i].String(), orderedURLs[i].String(); got != want {
+			t.Fatalf("Unexpected ordered url, got %s, want %s", got, want)
+		}
+	}
+
+	r2.RLock()
+	gotRandom := r2.urls
+	r2.RUnlock()
+	if got, want := len(gotRandom), len(orderedURLs); got != want {
+		t.Fatalf("Unexpected rem1 len URLs, got %d, want %d", got, want)
+	}
+
+	// These should be OUT of order.
+	var random bool
+	for i := range orderedURLs {
+		if gotRandom[i].String() != orderedURLs[i].String() {
+			random = true
+			break
+		}
+	}
+	if !random {
+		t.Fatal("Expected urls to be random")
 	}
 }
 
@@ -292,11 +356,8 @@ func TestLeafNodeAccountNotFound(t *testing.T) {
 
 	u, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ob.LeafNode.Port))
 
-	logFileName := createConfFile(t, []byte(""))
-	defer removeFile(t, logFileName)
-
 	oa := DefaultOptions()
-	oa.LeafNode.ReconnectInterval = 15 * time.Millisecond
+	oa.LeafNode.ReconnectInterval = 10 * time.Millisecond
 	oa.LeafNode.Remotes = []*RemoteLeafOpts{
 		{
 			LocalAccount: "foo",
@@ -327,20 +388,23 @@ func TestLeafNodeAccountNotFound(t *testing.T) {
 	// Wait for report of error
 	select {
 	case e := <-l.errCh:
-		if !strings.Contains(e, "No local account") {
+		if !strings.Contains(e, "Unable to lookup account") {
 			t.Fatalf("Expected error about no local account, got %s", e)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("Did not get the error")
 	}
 
+	// TODO below test is bogus. Instead add the account, do a reload, and make sure the connection works.
+
 	// For now, sa would try to recreate the connection for ever.
 	// Check that lid is increasing...
-	time.Sleep(100 * time.Millisecond)
-	lid := atomic.LoadUint64(&sa.gcid)
-	if lid < 4 {
-		t.Fatalf("Seems like connection was not retried")
-	}
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		if lid := atomic.LoadUint64(&sa.gcid); lid < 3 {
+			return fmt.Errorf("Seems like connection was not retried, lid currently only at %d", lid)
+		}
+		return nil
+	})
 }
 
 // This test ensures that we can connect using proper user/password
@@ -2402,6 +2466,10 @@ func TestLeafNodeRouteParseLSUnsub(t *testing.T) {
 }
 
 func TestLeafNodeOperatorBadCfg(t *testing.T) {
+	sysAcc, err := nkeys.CreateAccount()
+	require_NoError(t, err)
+	sysAccPk, err := sysAcc.PublicKey()
+	require_NoError(t, err)
 	tmpDir := createDir(t, "_nats-server")
 	defer removeDir(t, tmpDir)
 	for errorText, cfg := range map[string]string{
@@ -2421,6 +2489,7 @@ func TestLeafNodeOperatorBadCfg(t *testing.T) {
 			conf := createConfFile(t, []byte(fmt.Sprintf(`
 		port: -1
 		operator: %s
+		system_account: %s
 		resolver: {
 			type: cache
 			dir: %s
@@ -2428,7 +2497,7 @@ func TestLeafNodeOperatorBadCfg(t *testing.T) {
 		leafnodes: {
 			%s
 		}
-	`, ojwt, tmpDir, cfg)))
+	`, ojwt, sysAccPk, tmpDir, cfg)))
 			defer removeFile(t, conf)
 			opts := LoadConfig(conf)
 			s, err := NewServer(opts)
@@ -2436,6 +2505,9 @@ func TestLeafNodeOperatorBadCfg(t *testing.T) {
 				s.Shutdown()
 				t.Fatal("Expected an error")
 			}
+			// Since the server cannot be stopped, since it did not start,
+			// let's manually close the account resolver to avoid leaking go routines.
+			opts.AccountResolver.Close()
 			if err.Error() != errorText {
 				t.Fatalf("Expected error %s but got %s", errorText, err)
 			}
@@ -3226,16 +3298,15 @@ func TestLeafNodeLoopDetectionWithMultipleClusters(t *testing.T) {
 
 	checkClusterFormed(t, l1, l2)
 
-	u1, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", lo1.LeafNode.Port))
-	u2, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", lo2.LeafNode.Port))
-	urls := []*url.URL{u1, u2}
-
 	ro1 := DefaultOptions()
 	ro1.Cluster.Name = "remote"
 	ro1.Cluster.Host = "127.0.0.1"
 	ro1.Cluster.Port = -1
 	ro1.LeafNode.ReconnectInterval = 50 * time.Millisecond
-	ro1.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: urls}}
+	ro1.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{
+		{Scheme: "nats", Host: fmt.Sprintf("127.0.0.1:%d", lo1.LeafNode.Port)},
+		{Scheme: "nats", Host: fmt.Sprintf("127.0.0.1:%d", lo2.LeafNode.Port)},
+	}}}
 	r1 := RunServer(ro1)
 	defer r1.Shutdown()
 
@@ -3248,7 +3319,10 @@ func TestLeafNodeLoopDetectionWithMultipleClusters(t *testing.T) {
 	ro2.Cluster.Port = -1
 	ro2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", ro1.Cluster.Port))
 	ro2.LeafNode.ReconnectInterval = 50 * time.Millisecond
-	ro2.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: urls}}
+	ro2.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{
+		{Scheme: "nats", Host: fmt.Sprintf("127.0.0.1:%d", lo1.LeafNode.Port)},
+		{Scheme: "nats", Host: fmt.Sprintf("127.0.0.1:%d", lo2.LeafNode.Port)},
+	}}}
 	r2 := RunServer(ro2)
 	defer r2.Shutdown()
 
@@ -3448,6 +3522,163 @@ func TestLeafNodeNoPingBeforeConnect(t *testing.T) {
 		if strings.HasPrefix(string(l), "PING") {
 			checkLeafNodeConnected(t, s)
 			return
+		}
+	}
+}
+
+func TestLeafNodeNoMsgLoop(t *testing.T) {
+	hubConf := `
+		listen: "127.0.0.1:-1"
+		accounts {
+			FOO {
+				users [
+					{username: leaf, password: pass}
+					{username: user, password: pass}
+				]
+			}
+		}
+		cluster {
+			name: "hub"
+			listen: "127.0.0.1:-1"
+			%s
+		}
+		leafnodes {
+			listen: "127.0.0.1:-1"
+			authorization {
+				account: FOO
+			}
+		}
+	`
+	configS1 := createConfFile(t, []byte(fmt.Sprintf(hubConf, "")))
+	defer removeFile(t, configS1)
+	s1, o1 := RunServerWithConfig(configS1)
+	defer s1.Shutdown()
+
+	configS2S3 := createConfFile(t, []byte(fmt.Sprintf(hubConf, fmt.Sprintf(`routes: ["nats://127.0.0.1:%d"]`, o1.Cluster.Port))))
+	defer removeFile(t, configS2S3)
+	s2, o2 := RunServerWithConfig(configS2S3)
+	defer s2.Shutdown()
+
+	s3, _ := RunServerWithConfig(configS2S3)
+	defer s3.Shutdown()
+
+	checkClusterFormed(t, s1, s2, s3)
+
+	contentLN := `
+		listen: "127.0.0.1:%d"
+		accounts {
+			FOO {
+				users [
+					{username: leaf, password: pass}
+					{username: user, password: pass}
+				]
+			}
+		}
+		leafnodes {
+			remotes = [
+				{
+					url: "nats://leaf:pass@127.0.0.1:%d"
+					account: FOO
+				}
+			]
+		}
+	`
+	lnconf := createConfFile(t, []byte(fmt.Sprintf(contentLN, -1, o1.LeafNode.Port)))
+	defer removeFile(t, lnconf)
+	sl1, slo1 := RunServerWithConfig(lnconf)
+	defer sl1.Shutdown()
+
+	sl2, slo2 := RunServerWithConfig(lnconf)
+	defer sl2.Shutdown()
+
+	checkLeafNodeConnected(t, sl1)
+	checkLeafNodeConnected(t, sl2)
+
+	// Create users on each leafnode
+	nc1, err := nats.Connect(fmt.Sprintf("nats://user:pass@127.0.0.1:%d", slo1.Port))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc1.Close()
+
+	rch := make(chan struct{}, 1)
+	nc2, err := nats.Connect(
+		fmt.Sprintf("nats://user:pass@127.0.0.1:%d", slo2.Port),
+		nats.ReconnectWait(50*time.Millisecond),
+		nats.ReconnectHandler(func(_ *nats.Conn) {
+			rch <- struct{}{}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc2.Close()
+
+	// Create queue subs on sl2
+	nc2.QueueSubscribe("foo", "bar", func(_ *nats.Msg) {})
+	nc2.QueueSubscribe("foo", "bar", func(_ *nats.Msg) {})
+	nc2.Flush()
+
+	// Wait for interest to propagate to sl1
+	checkSubInterest(t, sl1, "FOO", "foo", 250*time.Millisecond)
+
+	// Create sub on sl1
+	ch := make(chan *nats.Msg, 10)
+	nc1.Subscribe("foo", func(m *nats.Msg) {
+		select {
+		case ch <- m:
+		default:
+		}
+	})
+	nc1.Flush()
+
+	checkSubInterest(t, sl2, "FOO", "foo", 250*time.Millisecond)
+
+	// Produce from sl1
+	nc1.Publish("foo", []byte("msg1"))
+
+	// Check message is received by plain sub
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("Did not receive message")
+	}
+
+	// Restart leaf node, this time make sure we connect to 2nd server.
+	sl2.Shutdown()
+
+	// Use config file but this time reuse the client port and set the 2nd server for
+	// the remote leaf node port.
+	lnconf = createConfFile(t, []byte(fmt.Sprintf(contentLN, slo2.Port, o2.LeafNode.Port)))
+	defer removeFile(t, lnconf)
+	sl2, _ = RunServerWithConfig(lnconf)
+	defer sl2.Shutdown()
+
+	checkLeafNodeConnected(t, sl2)
+
+	// Wait for client to reconnect
+	select {
+	case <-rch:
+	case <-time.After(time.Second):
+		t.Fatalf("Did not reconnect")
+	}
+
+	// Produce a new messages
+	for i := 0; i < 10; i++ {
+		nc1.Publish("foo", []byte(fmt.Sprintf("msg%d", 2+i)))
+
+		// Check sub receives 1 message
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("Did not receive message")
+		}
+		// Check that there is no more...
+		select {
+		case m := <-ch:
+			t.Fatalf("Loop: received second message %s", m.Data)
+		case <-time.After(50 * time.Millisecond):
+			// OK
 		}
 	}
 }

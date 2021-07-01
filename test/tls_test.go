@@ -1935,3 +1935,100 @@ func TestTLSClientSVIDAuth(t *testing.T) {
 		})
 	}
 }
+
+func TestTLSPinnedCertsClient(t *testing.T) {
+	tmpl := `
+	host: localhost
+	port: -1
+	tls {
+		ca_file: "configs/certs/ca.pem"
+		cert_file: "configs/certs/server-cert.pem"
+		key_file: "configs/certs/server-key.pem"
+		# Require a client certificate and map user id from certificate
+		verify: true
+		pinned_certs: ["%s"]
+	}`
+
+	confFileName := createConfFile(t, []byte(fmt.Sprintf(tmpl, "aaaaaaaa09fde09451411ba3b42c0f74727d61a974c69fd3cf5257f39c75f0e9")))
+	defer removeFile(t, confFileName)
+	srv, o := RunServerWithConfig(confFileName)
+	defer srv.Shutdown()
+
+	if len(o.TLSPinnedCerts) != 1 {
+		t.Fatal("expected one pinned cert")
+	}
+
+	opts := []nats.Option{
+		nats.RootCAs("configs/certs/ca.pem"),
+		nats.ClientCert("./configs/certs/client-cert.pem", "./configs/certs/client-key.pem"),
+	}
+
+	nc, err := nats.Connect(srv.ClientURL(), opts...)
+	if err == nil {
+		nc.Close()
+		t.Fatalf("Expected error trying to connect without a certificate in pinned_certs")
+	}
+
+	ioutil.WriteFile(confFileName, []byte(fmt.Sprintf(tmpl, "bf6f821f09fde09451411ba3b42c0f74727d61a974c69fd3cf5257f39c75f0e9")), 0660)
+	if err := srv.Reload(); err != nil {
+		t.Fatalf("on Reload got %v", err)
+	}
+	// reload pinned to the certs used
+	nc, err = nats.Connect(srv.ClientURL(), opts...)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	nc.Close()
+}
+
+func TestTLSPinnedCertsRoute(t *testing.T) {
+	tmplSeed := `
+	host: localhost
+	port: -1
+	cluster {
+		port: -1
+		tls {
+			ca_file: "configs/certs/ca.pem"
+			cert_file: "configs/certs/server-cert.pem"
+			key_file: "configs/certs/server-key.pem"
+		}
+	}`
+	// this server connects to seed, but is set up to not trust seeds cert
+	tmplSrv := `
+	host: localhost
+	port: -1
+	cluster {
+		port: -1
+		routes = [nats-route://localhost:%d]
+		tls {
+			ca_file: "configs/certs/ca.pem"
+			cert_file: "configs/certs/server-cert.pem"
+			key_file: "configs/certs/server-key.pem"
+			# Require a client certificate and map user id from certificate
+			verify: true
+			# expected to fail the seed server
+			pinned_certs: ["%s"]
+		}
+	}`
+
+	confSeed := createConfFile(t, []byte(tmplSeed))
+	defer removeFile(t, confSeed)
+	srvSeed, o := RunServerWithConfig(confSeed)
+	defer srvSeed.Shutdown()
+
+	confSrv := createConfFile(t, []byte(fmt.Sprintf(tmplSrv, o.Cluster.Port, "89386860ea1222698ea676fc97310bdf2bff6f7e2b0420fac3b3f8f5a08fede5")))
+	defer removeFile(t, confSrv)
+	srv, _ := RunServerWithConfig(confSrv)
+	defer srv.Shutdown()
+
+	checkClusterFormed(t, srvSeed, srv)
+
+	// this change will result in the server being and remaining disconnected
+	ioutil.WriteFile(confSrv, []byte(fmt.Sprintf(tmplSrv, o.Cluster.Port, "aaaaaaaa09fde09451411ba3b42c0f74727d61a974c69fd3cf5257f39c75f0e9")), 0660)
+	if err := srv.Reload(); err != nil {
+		t.Fatalf("on Reload got %v", err)
+	}
+
+	checkNumRoutes(t, srvSeed, 0)
+	checkNumRoutes(t, srv, 0)
+}

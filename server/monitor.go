@@ -1054,6 +1054,7 @@ type Varz struct {
 type JetStreamVarz struct {
 	Config *JetStreamConfig `json:"config,omitempty"`
 	Stats  *JetStreamStats  `json:"stats,omitempty"`
+	Meta   *ClusterInfo     `json:"meta,omitempty"`
 }
 
 // ClusterOptsVarz contains monitoring cluster information
@@ -1101,11 +1102,18 @@ type LeafNodeOptsVarz struct {
 	Remotes     []RemoteLeafOptsVarz `json:"remotes,omitempty"`
 }
 
+// Contains lists of subjects not allowed to be imported/exported
+type DenyRules struct {
+	Exports []string `json:"exports,omitempty"`
+	Imports []string `json:"imports,omitempty"`
+}
+
 // RemoteLeafOptsVarz contains monitoring remote leaf node information
 type RemoteLeafOptsVarz struct {
-	LocalAccount string   `json:"local_account,omitempty"`
-	TLSTimeout   float64  `json:"tls_timeout,omitempty"`
-	URLs         []string `json:"urls,omitempty"`
+	LocalAccount string     `json:"local_account,omitempty"`
+	TLSTimeout   float64    `json:"tls_timeout,omitempty"`
+	URLs         []string   `json:"urls,omitempty"`
+	Deny         *DenyRules `json:"deny,omitempty"`
 }
 
 // VarzOptions are the options passed to Varz().
@@ -1278,10 +1286,18 @@ func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
 	if l := len(ln.Remotes); l > 0 {
 		rlna := make([]RemoteLeafOptsVarz, l)
 		for i, r := range ln.Remotes {
+			var deny *DenyRules
+			if len(r.DenyImports) > 0 || len(r.DenyExports) > 0 {
+				deny = &DenyRules{
+					Imports: r.DenyImports,
+					Exports: r.DenyExports,
+				}
+			}
 			rlna[i] = RemoteLeafOptsVarz{
 				LocalAccount: r.LocalAccount,
 				URLs:         urlsToStrings(r.URLs),
 				TLSTimeout:   r.TLSTimeout,
+				Deny:         deny,
 			}
 		}
 		varz.LeafNode.Remotes = rlna
@@ -1369,12 +1385,11 @@ func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool, pcpu float64
 	v.OutBytes = atomic.LoadInt64(&s.outBytes)
 	v.SlowConsumers = atomic.LoadInt64(&s.slowConsumers)
 
+	// Make sure to reset in case we are re-using.
+	v.Subscriptions = 0
 	s.accounts.Range(func(k, val interface{}) bool {
 		acc := val.(*Account)
-		acc.sl.RLock()
-		v.Subscriptions += acc.sl.count
-		acc.sl.RUnlock()
-
+		v.Subscriptions += acc.sl.Count()
 		return true
 	})
 
@@ -1417,6 +1432,9 @@ func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool, pcpu float64
 		// FIXME(dlc) - We have lock inversion that needs to be fixed up properly.
 		s.mu.Unlock()
 		v.JetStream.Stats = s.js.usageStats()
+		if mg := s.js.getMetaGroup(); mg != nil {
+			v.JetStream.Meta = s.raftNodeToClusterInfo(mg)
+		}
 		s.mu.Lock()
 	}
 }
@@ -2325,7 +2343,7 @@ func (s *Server) accountDetail(jsa *jsAccount, optStreams, optConsumers, optCfg 
 				Config:  cfg,
 			}
 			if optConsumers {
-				for _, consumer := range stream.getConsumers() {
+				for _, consumer := range stream.getPublicConsumers() {
 					cInfo := consumer.info()
 					if !optCfg {
 						cInfo.Config = nil
@@ -2355,6 +2373,24 @@ func (s *Server) JszAccount(opts *JSzOptions) (*AccountDetail, error) {
 		return nil, fmt.Errorf("account %q not jetstream enabled", acc)
 	}
 	return s.accountDetail(jsa, opts.Streams, opts.Consumer, opts.Config), nil
+}
+
+// helper to get cluster info from node via dummy group
+func (s *Server) raftNodeToClusterInfo(node RaftNode) *ClusterInfo {
+	if node == nil {
+		return nil
+	}
+	peers := node.Peers()
+	peerList := make([]string, len(peers))
+	for i, p := range peers {
+		peerList[i] = p.ID
+	}
+	group := &raftGroup{
+		Name:  _EMPTY_,
+		Peers: peerList,
+		node:  node,
+	}
+	return s.js.clusterInfo(group)
 }
 
 // Jsz returns a Jsz structure containing information about JetStream.
@@ -2391,23 +2427,6 @@ func (s *Server) Jsz(opts *JSzOptions) (*JSInfo, error) {
 		}
 	}
 
-	// helper to get cluster info from node via dummy group
-	toClusterInfo := func(node RaftNode) *ClusterInfo {
-		if node == nil {
-			return nil
-		}
-		peers := node.Peers()
-		peerList := make([]string, len(peers))
-		for i, p := range node.Peers() {
-			peerList[i] = p.ID
-		}
-		group := &raftGroup{
-			Name:  "",
-			Peers: peerList,
-			node:  node,
-		}
-		return s.js.clusterInfo(group)
-	}
 	jsi := &JSInfo{
 		ID:  s.ID(),
 		Now: time.Now().UTC(),
@@ -2423,10 +2442,12 @@ func (s *Server) Jsz(opts *JSzOptions) (*JSInfo, error) {
 	for _, info := range s.js.accounts {
 		accounts = append(accounts, info)
 	}
-	jsi.APICalls = atomic.LoadInt64(&s.js.apiCalls)
 	s.js.mu.RUnlock()
+	jsi.APICalls = atomic.LoadInt64(&s.js.apiCalls)
 
-	jsi.Meta = toClusterInfo(s.js.getMetaGroup())
+	jsi.Meta = s.raftNodeToClusterInfo(s.js.getMetaGroup())
+	jsi.JetStreamStats = *s.js.usageStats()
+
 	filterIdx := -1
 	for i, jsa := range accounts {
 		if jsa.acc().GetName() == opts.Account {
@@ -2434,10 +2455,6 @@ func (s *Server) Jsz(opts *JSzOptions) (*JSInfo, error) {
 		}
 		jsa.mu.RLock()
 		jsi.Streams += len(jsa.streams)
-		jsi.Memory += uint64(jsa.usage.mem)
-		jsi.Store += uint64(jsa.usage.store)
-		jsi.API.Total += jsa.usage.api
-		jsi.API.Errors += jsa.usage.err
 		for _, stream := range jsa.streams {
 			streamState := stream.state()
 			jsi.Messages += streamState.Msgs

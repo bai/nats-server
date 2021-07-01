@@ -58,6 +58,18 @@ type cluster struct {
 	t       *testing.T
 }
 
+func checkNatsError(t *testing.T, e *ApiError, id ErrorIdentifier) {
+	t.Helper()
+	ae, ok := ApiErrors[id]
+	if !ok {
+		t.Fatalf("Unknown error ID identifier: %d", id)
+	}
+
+	if e.ErrCode != ae.ErrCode {
+		t.Fatalf("Did not get NATS Error %d: %+v", e.ErrCode, e)
+	}
+}
+
 // Creates a full cluster with numServers and given name and makes sure its well formed.
 // Will have Gateways and Leaf Node connections active.
 func createClusterWithName(t *testing.T, clusterName string, numServers int, connectTo ...*cluster) *cluster {
@@ -184,8 +196,8 @@ func (c *cluster) shutdown() {
 	for i, s := range c.servers {
 		sd := s.StoreDir()
 		s.Shutdown()
-		if cf := c.opts[i].ConfigFile; cf != "" {
-			os.RemoveAll(cf)
+		if cf := c.opts[i].ConfigFile; cf != _EMPTY_ {
+			os.Remove(cf)
 		}
 		if sd != _EMPTY_ {
 			os.RemoveAll(sd)
@@ -198,13 +210,17 @@ func shutdownCluster(c *cluster) {
 }
 
 func (c *cluster) randomServer() *Server {
+	return c.randomServerFromCluster(c.name)
+}
+
+func (c *cluster) randomServerFromCluster(cname string) *Server {
 	// Since these can be randomly shutdown in certain tests make sure they are running first.
 	// Copy our servers list and shuffle then walk looking for first running server.
 	cs := append(c.servers[:0:0], c.servers...)
 	rand.Shuffle(len(cs), func(i, j int) { cs[i], cs[j] = cs[j], cs[i] })
 
 	for _, s := range cs {
-		if s.Running() {
+		if s.Running() && s.ClusterName() == cname {
 			return s
 		}
 	}
